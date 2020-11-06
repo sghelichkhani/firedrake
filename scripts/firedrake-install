@@ -488,6 +488,12 @@ pipinstall = pip + ["install",
                     "--no-build-isolation",
                     "--no-binary", ",".join(wheel_blacklist)]
 
+if mode == "install":
+    use_petsc4py_in_petsc = "petsc4py" not in branches
+else:
+    src_petsc4py_exists = os.path.exists(os.path.join(firedrake_env, "src/petsc4py"))
+    use_petsc4py_in_petsc = not (src_petsc4py_exists and args.honour_petsc_dir)
+
 
 # This context manager should be used whenever arguments should be temporarily added to pipinstall.
 class pipargs(object):
@@ -674,6 +680,9 @@ def git_clone(url):
     if name == "petsc" and args.honour_petsc_dir:
         log.info("Using existing petsc installation\n")
         return name
+    elif name == "petsc4py" and use_petsc4py_in_petsc:
+        log.info("Not cloning petsc4py from firedrake-project repo: use petsc4py in petsc source tree.\n")
+        return name
     log.info("Cloning %s\n" % name)
     branch = branches.get(name.lower(), branch)
     try:
@@ -822,7 +831,9 @@ def install(package):
         build_and_install_petsc()
     elif package == "slepc/":
         build_and_install_slepc()
-    elif package in ["petsc4py/", "slepc4py/"]:
+    elif package == "petsc4py/":
+        run_pip_install(["--ignore-installed", get_petsc4py_dir()])
+    elif package == "slepc4py/":
         # The following outrageous hack works around the fact that petsc and co. cannot be installed in developer mode.
         run_pip_install(["--ignore-installed", package])
     elif package == "h5py/":
@@ -890,6 +901,14 @@ def get_petsc_dir():
     return petsc_dir, petsc_arch
 
 
+def get_petsc4py_dir():
+    if use_petsc4py_in_petsc:
+        petsc_dir, _ = get_petsc_dir()
+        return os.path.join(petsc_dir, "src/binding/petsc4py/")
+    else:
+        return "petsc4py/"
+
+
 def get_slepc_dir():
     petsc_dir, petsc_arch = get_petsc_dir()
     if args.honour_petsc_dir:
@@ -947,7 +966,6 @@ def build_and_install_petsc():
 
 
 def build_and_install_h5py():
-    import shutil
     log.info("Installing h5py")
     # Clean up old downloads
     if os.path.exists("h5py-2.5.0"):
@@ -1599,7 +1617,10 @@ else:
         petsc_changed = git_update("petsc", deps["petsc"])
     else:
         petsc_changed = False
-    petsc4py_changed = git_update("petsc4py", deps["petsc4py"])
+    if use_petsc4py_in_petsc:
+        petsc4py_changed = petsc_changed
+    else:
+        petsc4py_changed = git_update("petsc4py", deps["petsc4py"])
 
     packages.remove("petsc")
     packages.remove("petsc4py")
@@ -1630,6 +1651,9 @@ else:
             if not args.honour_petsc_dir and (args.rebuild or petsc_changed):
                 clean("petsc/")
                 install("petsc/")
+                if src_petsc4py_exists:
+                    clean("petsc4py/")
+                    shutil.move("petsc4py", "petsc4py_old")
         if not args.honour_petsc_dir:
             os.environ["PETSC_DIR"] = petsc_dir
             os.environ["PETSC_ARCH"] = petsc_arch
@@ -1650,10 +1674,9 @@ else:
 
     with pipargs("--no-deps"):
         if args.rebuild or petsc_changed or petsc4py_changed:
-            clean("petsc4py/")
+            clean(get_petsc4py_dir())
             with environment(**compiler_env):
                 install("petsc4py/")
-
         # Always rebuild h5py.
         with environment(**compiler_env):
             build_and_install_h5py()
