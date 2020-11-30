@@ -11,7 +11,8 @@ import numbers
 import abc
 
 from mpi4py import MPI
-from firedrake.utils import IntType, RealType
+import h5py
+from petsc4py.PETSc import ViewerHDF5
 from pyop2 import op2
 from pyop2.base import DataSet
 from pyop2.mpi import COMM_WORLD, dup_comm
@@ -24,6 +25,7 @@ import firedrake.cython.extrusion_numbering as extnum
 import firedrake.extrusion_utils as eutils
 import firedrake.cython.spatialindex as spatialindex
 import firedrake.utils as utils
+from firedrake.utils import IntType, RealType
 from firedrake.interpolation import interpolate
 from firedrake.logging import info_red
 from firedrake.parameters import parameters
@@ -303,6 +305,33 @@ def _from_triangle(filename, dim, comm):
                 join = plex.getJoin(vertices)
                 plex.setLabelValue(dmcommon.FACE_SETS_LABEL, join[0], bid)
 
+    return plex
+
+
+def _from_hdf5(filename, comm):
+    comm = PETSc.Comm(comm=comm)
+    # Determine the format from an existing h5 group.
+    # TODO: Looking for `/topology` group may not be the best.
+    with h5py.File(filename, 'r') as f:
+        if '/topology' in f:
+            informat = ViewerHDF5.Format.HDF5_PETSC
+        else:
+            informat = ViewerHDF5.Format.HDF5_XDMF
+    vwr = ViewerHDF5()
+    vwr.create(filename, mode='r', comm=comm)
+    vwr.pushFormat(format=informat)
+    vwr.pushGroup("mesh0")  # Currently ignored.
+    plex = PETSc.DMPlex()
+    plex.create(comm=comm)
+    plex.load(viewer=vwr)  # TODO: load labels, too.
+    plex.setOptionsPrefix("loaded_")
+    plex.viewFromOptions("-dm_view")
+    vwr.popGroup()
+    vwr.popFormat()
+    vwr.destroy()
+    plex.interpolate()
+    plex.setOptionsPrefix("interpolated_")
+    plex.viewFromOptions("-dm_view")
     return plex
 
 
@@ -695,6 +724,8 @@ class MeshTopology(AbstractMeshTopology):
             # it, we grow the halo.
             self.set_partitioner(distribute)
             plex.distribute(overlap=0)
+            plex.setOptionsPrefix("distributed_")
+            plex.viewFromOptions("-dm_view")
 
         tdim = plex.getDimension()
 
@@ -1553,6 +1584,16 @@ values from f.)"""
         current = super(MeshGeometry, self).__dir__()
         return list(OrderedDict.fromkeys(dir(self._topology) + current))
 
+    def view(self, fname, formt):
+        vwr = ViewerHDF5()
+        vwr.create(fname, mode='w', comm=self._topology_dm.comm)
+        vwr.pushFormat(format=formt)
+        vwr.pushGroup("mesh0")  # Currently ignored.
+        self._topology_dm.view(viewer=vwr)
+        vwr.popGroup()
+        vwr.popFormat()
+        vwr.destroy()
+
 
 def make_mesh_from_coordinates(coordinates):
     """Given a coordinate field build a new mesh, using said coordinate field.
@@ -1623,6 +1664,7 @@ def Mesh(meshfile, **kwargs):
     * Exodus: with extension `.e`, `.exo`
     * CGNS: with extension `.cgns`
     * Triangle: with extension `.node`
+    * HDF5: with extension `.h5`, `.hdf5`
 
     .. note::
 
@@ -1676,6 +1718,8 @@ def Mesh(meshfile, **kwargs):
                 plex = _from_gmsh(meshfile, comm)
         elif ext.lower() == '.node':
             plex = _from_triangle(meshfile, geometric_dim, comm)
+        elif ext.lower() in ['.h5', '.hdf5']:
+            plex = _from_hdf5(meshfile, comm)
         else:
             raise RuntimeError("Mesh file %s has unknown format '%s'."
                                % (meshfile, ext[1:]))
@@ -1684,11 +1728,11 @@ def Mesh(meshfile, **kwargs):
     topology = MeshTopology(plex, name=name, reorder=reorder,
                             distribution_parameters=distribution_parameters)
 
-    tcell = topology.ufl_cell()
-    if geometric_dim is None:
-        geometric_dim = tcell.topological_dimension()
-    cell = tcell.reconstruct(geometric_dimension=geometric_dim)
-
+    # Construct coordinate element
+    # TODO: meshfile might indicates higher-order coordinate element
+    cell = topology.ufl_cell()
+    geometric_dim = topology._topology_dm.getCoordinateDim()
+    cell = cell.reconstruct(geometric_dimension=geometric_dim)
     element = ufl.VectorElement("Lagrange", cell, 1)
     # Create mesh object
     mesh = MeshGeometry.__new__(MeshGeometry, element)
