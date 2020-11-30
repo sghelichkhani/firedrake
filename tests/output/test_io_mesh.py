@@ -15,7 +15,7 @@ def test_io_hdf5_xdmf():
     # Create mesh.
     mesh = RectangleMesh(4, 1, 4., 1.)
     mesh.init()
-    plex = mesh._topology_dm
+    plex = mesh.topology_dm
     plex.setOptionsPrefix("original_")
     plex.viewFromOptions("-dm_view")
     # Save mesh.
@@ -34,7 +34,7 @@ def test_io_hdf5_xdmf():
             mesh = Mesh(fname, comm=comm)
             mesh.init()
             # Test if DM is distributed.
-            flg = mesh._topology_dm.isDistributed()
+            flg = mesh.topology_dm.isDistributed()
             PETSc.Sys.Print("Loaded mesh distributed? %s" % flg, comm=comm)
             # Save.
             mesh.view(fname, outformat)
