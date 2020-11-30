@@ -685,31 +685,15 @@ class MeshTopology(AbstractMeshTopology):
         # Note.  This must come before distribution, because otherwise
         # DMPlex will consider facets on the domain boundary to be
         # exterior, which is wrong.
-        label_boundary = (self.comm.size == 1) or distribute
+        label_boundary = not plex.isDistributed()
         dmcommon.label_facets(plex, label_boundary=label_boundary)
 
-        # Distribute the dm to all ranks
+        # Distribute/redistribute the dm to all ranks
         if self.comm.size > 1 and distribute:
             # We distribute with overlap zero, in case we're going to
             # refine this mesh in parallel.  Later, when we actually use
             # it, we grow the halo.
-            partitioner = plex.getPartitioner()
-            if IntType.itemsize == 8:
-                # Default to PTSCOTCH on 64bit ints (Chaco is 32 bit int only)
-                from firedrake_configuration import get_config
-                if get_config().get("options", {}).get("with_parmetis", False):
-                    partitioner.setType(partitioner.Type.PARMETIS)
-                else:
-                    partitioner.setType(partitioner.Type.PTSCOTCH)
-            else:
-                partitioner.setType(partitioner.Type.CHACO)
-            try:
-                sizes, points = distribute
-                partitioner.setType(partitioner.Type.SHELL)
-                partitioner.setShellPartition(self.comm.size, sizes, points)
-            except TypeError:
-                pass
-            partitioner.setFromOptions()
+            self.set_partitioner(distribute)
             plex.distribute(overlap=0)
 
         tdim = plex.getDimension()
@@ -921,6 +905,27 @@ class MeshTopology(AbstractMeshTopology):
     def cell_set(self):
         size = list(self._entity_classes[self.cell_dimension(), :])
         return op2.Set(size, "Cells", comm=self.comm)
+
+    def set_partitioner(self, distribute):
+        plex = self._topology_dm
+        partitioner = plex.getPartitioner()
+        if IntType.itemsize == 8 or plex.isDistributed():
+            # Default to PTSCOTCH on 64bit ints (Chaco is 32 bit int only).
+            # Chaco does not work on distributed meshes.
+            from firedrake_configuration import get_config
+            if get_config().get("options", {}).get("with_parmetis", False):
+                partitioner.setType(partitioner.Type.PARMETIS)
+            else:
+                partitioner.setType(partitioner.Type.PTSCOTCH)
+        else:
+            partitioner.setType(partitioner.Type.CHACO)
+        try:
+            sizes, points = distribute
+            partitioner.setType(partitioner.Type.SHELL)
+            partitioner.setShellPartition(self.comm.size, sizes, points)
+        except TypeError:
+            pass
+        partitioner.setFromOptions()
 
 
 class ExtrudedMeshTopology(MeshTopology):
