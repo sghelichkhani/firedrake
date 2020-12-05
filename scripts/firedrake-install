@@ -16,6 +16,7 @@ import shlex
 from glob import iglob
 from itertools import chain
 import re
+import importlib
 
 osname = platform.uname()[0]
 
@@ -1489,6 +1490,17 @@ with open(config_location, "w") as f:
     f.write(json_output)
 log.info("Configuration saved to " + config_location)
 
+
+def is_installed(name):
+    # Return if package `name` is installed.
+    try:
+        importlib.import_module(name)
+    except ModuleNotFoundError:
+        return False
+    else:
+        return True
+
+
 if mode == "install":
     os.mkdir("src")
     os.chdir("src")
@@ -1599,7 +1611,7 @@ else:
         petsc_changed = git_update("petsc", deps["petsc"])
     else:
         petsc_changed = False
-    petsc4py_changed = git_update("petsc4py", deps["petsc4py"])
+    petsc4py_changed = git_update("petsc4py", deps["petsc4py"]) or not is_installed("petsc4py")
 
     packages.remove("petsc")
     packages.remove("petsc4py")
