@@ -1694,21 +1694,21 @@ if mode == "install":
     # doesn't work.  Moreover, they have spiked the file such that it
     # calls sys.exit, which will kill any attempts to create a venv
     # with pip.
-    try:
-        import ensurepip        # noqa: F401
-        with_pip = True
-    except ImportError:
-        with_pip = False
-    import venv
-    venv.EnvBuilder(with_pip=with_pip).create(firedrake_env)
-    if not with_pip:
-        import urllib.request
-        log.debug("ensurepip unavailable, bootstrapping pip using get-pip.py")
-        urllib.request.urlretrieve("https://bootstrap.pypa.io/get-pip.py", filename="get-pip.py")
-        check_call([python, "get-pip.py"])
-        log.debug("bootstrapping pip succeeded")
-        log.debug("Removing get-pip.py")
-        os.remove("get-pip.py")
+    # try:
+    #     import ensurepip        # noqa: F401
+    #     with_pip = True
+    # except ImportError:
+    #     with_pip = False
+    # import venv
+    # venv.EnvBuilder(with_pip=with_pip).create(firedrake_env)
+    # if not with_pip:
+    #     import urllib.request
+    #     log.debug("ensurepip unavailable, bootstrapping pip using get-pip.py")
+    #     urllib.request.urlretrieve("https://bootstrap.pypa.io/get-pip.py", filename="get-pip.py")
+    #     check_call([python, "get-pip.py"])
+    #     log.debug("bootstrapping pip succeeded")
+    #     log.debug("Removing get-pip.py")
+    #     os.remove("get-pip.py")
 
     # We haven't activated the venv so we need to manually set the environment.
     os.environ["VIRTUAL_ENV"] = firedrake_env
@@ -1733,28 +1733,28 @@ petsc_dir, petsc_arch = get_petsc_dir()
 if options["slepc"]:
     slepc_dir, _ = get_slepc_dir()
 
-if mode == "install":
-    should_link = not args.honour_petsc_dir or options.get("mpicc") is not None
-
-    # Set up the MPI wrappers
-    for opt in ["mpicc", "mpicxx", "mpif90", "mpiexec"]:
-        if options.get(opt):
-            name = options[opt]
-            src = shutil.which(name)
-        else:
-            src = os.path.join(petsc_dir, petsc_arch, "bin", opt)
-        dest = os.path.join(firedrake_env, "bin", opt)
-        # Remove old symlinks
-        if os.path.lexists(dest):
-            os.remove(dest)
-        elif os.path.exists(dest):
-            os.remove(dest)
-        if should_link:
-            log.debug("Creating a wrapper for %s from %s to %s" % (opt, src, dest))
-            # use low-level os.open to ensure permissions (incl. exec.) are set according to umask
-            fd = os.open(dest, os.O_CREAT | os.O_WRONLY)
-            with os.fdopen(fd, "w") as f:
-                f.write('#!/bin/bash' + os.linesep + src + ' "$@"')
+# if mode == "install":
+#     should_link = not args.honour_petsc_dir or options.get("mpicc") is not None
+#
+#     # Set up the MPI wrappers
+#     for opt in ["mpicc", "mpicxx", "mpif90", "mpiexec"]:
+#         if options.get(opt):
+#             name = options[opt]
+#             src = shutil.which(name)
+#         else:
+#             src = os.path.join(petsc_dir, petsc_arch, "bin", opt)
+#         dest = os.path.join(firedrake_env, "bin", opt)
+#         # Remove old symlinks
+#         if os.path.lexists(dest):
+#             os.remove(dest)
+#         elif os.path.exists(dest):
+#             os.remove(dest)
+#         if should_link:
+#             log.debug("Creating a wrapper for %s from %s to %s" % (opt, src, dest))
+#             # use low-level os.open to ensure permissions (incl. exec.) are set according to umask
+#             fd = os.open(dest, os.O_CREAT | os.O_WRONLY)
+#             with os.fdopen(fd, "w") as f:
+#                 f.write('#!/bin/bash' + os.linesep + src + ' "$@"')
 
 cc = options["mpicc"]
 cxx = options["mpicxx"]
