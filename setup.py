@@ -68,11 +68,13 @@ link_args = ["-L%s/lib" % d for d in dirs] + ["-Wl,-rpath,%s/lib" % d for d in d
 libspatialindex_so = Path(rtree.core.rt._name).absolute()
 link_args += [str(libspatialindex_so)]
 link_args += ["-Wl,-rpath,%s" % libspatialindex_so.parent]
+extra_compile_args = ["-Wno-incompatible-function-pointer-types"]
 
 extensions = [Extension("firedrake.cython.{}".format(ext),
                         sources=[os.path.join("firedrake", "cython", "{}.pyx".format(ext))],
                         include_dirs=include_dirs,
                         libraries=libs,
+                        extra_compile_args=extra_compile_args,
                         extra_link_args=link_args,
                         cython_compile_time_env=cython_compile_time_env) for (ext, libs) in cythonfiles]
 if 'CC' not in env:
