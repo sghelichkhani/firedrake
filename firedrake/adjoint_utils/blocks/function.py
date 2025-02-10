@@ -79,6 +79,7 @@ class FunctionAssignBlock(Block):
                 )
                 diff_expr_assembled = firedrake.Function(adj_input_func.function_space())
                 diff_expr_assembled.interpolate(ufl.conj(diff_expr))
+                diff_expr_assembled = diff_expr_assembled.riesz_representation(riesz_map="l2")
                 adj_output = firedrake.Function(
                     R, val=firedrake.assemble(ufl.Action(diff_expr_assembled, adj_input_func))
                 )
@@ -242,11 +243,13 @@ class FunctionMergeBlock(Block):
         else:
             return adj_inputs[0]
 
-    def evaluate_tlm(self):
+    def evaluate_tlm(self, markings=False):
         tlm_input = self.get_dependencies()[0].tlm_value
         if tlm_input is None:
             return
         output = self.get_outputs()[0]
+        if markings and not output.marked_in_path:
+            return
         fs = output.output.function_space()
         f = type(output.output)(fs)
         output.add_tlm_output(
@@ -268,3 +271,90 @@ class FunctionMergeBlock(Block):
     def __str__(self):
         deps = self.get_dependencies()
         return f"{deps[1]}[{self.idx}].assign({deps[0]})"
+
+
+class CofunctionAssignBlock(Block):
+    """Class specifically for the case b.assign(a).
+
+    All other cofunction assignment operations are annotated via Assemble. In
+    effect this means that this is the annotation of an identity operation.
+
+    Parameters
+    ----------
+    lhs:
+        The target of the assignment.
+    rhs:
+        The cofunction being assigned.
+    """
+
+    def __init__(self, lhs: firedrake.Cofunction, rhs: firedrake.Cofunction,
+                 ad_block_tag=None, rhs_from_assemble=False):
+        super().__init__(ad_block_tag=ad_block_tag)
+        self.add_output(lhs.block_variable)
+        self.add_dependency(rhs)
+        if rhs_from_assemble:
+            # The `rhs_from_assemble` flag is set to `True` only when the
+            # previous block is an Assemble Block, which results from the
+            # Firedrake development API and not something implemented for
+            # the user.
+
+            # Checkpoint should be created at this point.
+            assert self._dependencies[0].checkpoint is not None
+            # When `rhs` is a output of an Assemble Block, there is no
+            # need to duplicate the output with checkpoint data.
+            # For further clarification, see how the `rhs_from_assemble` flag
+            # is set in the `firedrake.CoFunction.assign` method.
+            self._dependencies[0].output = DelegatedFunctionCheckpoint(
+                self._dependencies[0])
+
+    def recompute_component(self, inputs, block_variable, idx, prepared=None):
+        """Recompute the assignment.
+
+        Parameters
+        ----------
+        inputs : list of Function or Constant
+            The variable in the RHS of the assignment.
+        block_variable : pyadjoint.block_variable.BlockVariable
+            The output block variable.
+        idx : int
+            Index associated to the inputs list.
+        prepared :
+            The precomputed RHS value.
+
+        Notes
+        -----
+        Recomputes the block_variable only if the checkpoint was not delegated
+        to another :class:`~firedrake.function.Function`.
+
+        Returns
+        -------
+        Cofunction
+            Return either the firedrake cofunction or `BlockVariable`
+            checkpoint to which was delegated the checkpointing.
+        """
+        assert idx == 0  # There must be only one RHS.
+        if isinstance(block_variable.checkpoint, DelegatedFunctionCheckpoint):
+            return block_variable.checkpoint
+        else:
+            output = firedrake.Cofunction(
+                block_variable.output.function_space()
+            )
+            output.assign(inputs[0])
+            return maybe_disk_checkpoint(output)
+
+    def evaluate_adj_component(self, inputs, adj_inputs, block_variable, idx,
+                               prepared=None):
+        return adj_inputs[0]
+
+    def evaluate_hessian_component(self, inputs, hessian_inputs, adj_inputs,
+                                   block_variable, idx,
+                                   relevant_dependencies, prepared=None):
+        return hessian_inputs[0]
+
+    def evaluate_tlm_component(self, inputs, tlm_inputs, block_variable, idx,
+                               prepared=None):
+        return tlm_inputs[0]
+
+    def __str__(self):
+        deps = self.get_dependencies()
+        return f"assign({deps[0]})"

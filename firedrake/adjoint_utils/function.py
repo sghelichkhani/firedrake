@@ -196,11 +196,11 @@ class FunctionMixin(FloatingType):
         return wrapper
 
     @staticmethod
-    def _ad_annotate_idiv(__idiv__):
-        @wraps(__idiv__)
+    def _ad_annotate_itruediv(__itruediv__):
+        @wraps(__itruediv__)
         def wrapper(self, other, **kwargs):
             with stop_annotating():
-                func = __idiv__(self, other, **kwargs)
+                func = __itruediv__(self, other, **kwargs)
 
             ad_block_tag = kwargs.pop("ad_block_tag", None)
             annotate = annotate_tape(kwargs)
@@ -300,7 +300,6 @@ class FunctionMixin(FloatingType):
         with checkpoint_init_data():
             super()._ad_will_add_as_dependency()
 
-    @no_annotations
     def _ad_mul(self, other):
         from firedrake import Function
 
@@ -309,7 +308,6 @@ class FunctionMixin(FloatingType):
         r.assign(other * self)
         return r
 
-    @no_annotations
     def _ad_add(self, other):
         from firedrake import Function
 
@@ -363,16 +361,12 @@ class FunctionMixin(FloatingType):
         return self.function_space().dim()
 
     def _ad_imul(self, other):
-        vec = self.vector()
-        vec *= other
+        self *= other
+        return self
 
     def _ad_iadd(self, other):
-        vec = self.vector()
-        ovec = other.vector()
-        if ovec.dat == vec.dat:
-            vec *= 2
-        else:
-            vec += ovec
+        self += other
+        return self
 
     def _ad_function_space(self, mesh):
         return self.ufl_function_space()
@@ -397,6 +391,18 @@ class FunctionMixin(FloatingType):
         for i in range(len(npdata)):
             npdata[i] = f(npdata[i], npdatay[i])
         vec.set_local(npdata)
+
+    def _ad_from_petsc(self, vec):
+        with self.dat.vec_wo as self_v:
+            vec.copy(result=self_v)
+
+    def _ad_to_petsc(self, vec=None):
+        with self.dat.vec_ro as self_v:
+            if vec:
+                self_v.copy(result=vec)
+            else:
+                vec = self_v.copy()
+        return vec
 
     def __deepcopy__(self, memodict={}):
         return self.copy(deepcopy=True)

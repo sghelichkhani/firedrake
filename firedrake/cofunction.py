@@ -3,13 +3,15 @@ import ufl
 
 from ufl.form import BaseForm
 from pyop2 import op2, mpi
-from pyadjoint.tape import stop_annotating, annotate_tape
+from pyadjoint.tape import stop_annotating, annotate_tape, get_working_tape
+from finat.ufl import MixedElement
 import firedrake.assemble
 import firedrake.functionspaceimpl as functionspaceimpl
 from firedrake import utils, vector, ufl_expr
 from firedrake.utils import ScalarType
 from firedrake.adjoint_utils.function import FunctionMixin
 from firedrake.adjoint_utils.checkpointing import DelegatedFunctionCheckpoint
+from firedrake.adjoint_utils.blocks.function import CofunctionAssignBlock
 from firedrake.petsc import PETSc
 
 
@@ -118,11 +120,14 @@ class Cofunction(ufl.Cofunction, FunctionMixin):
 
     @utils.cached_property
     def _components(self):
-        if self.function_space().value_size == 1:
+        if self.function_space().rank == 0:
             return (self, )
         else:
-            return tuple(type(self)(self.function_space().sub(i), val=op2.DatView(self.dat, i))
-                         for i in range(self.function_space().value_size))
+            if self.dof_dset.cdim == 1:
+                return (type(self)(self.function_space().sub(0), val=self.dat),)
+            else:
+                return tuple(type(self)(self.function_space().sub(i), val=op2.DatView(self.dat, j))
+                             for i, j in enumerate(np.ndindex(self.dof_dset.dim)))
 
     @PETSc.Log.EventDecorator()
     def sub(self, i):
@@ -136,9 +141,9 @@ class Cofunction(ufl.Cofunction, FunctionMixin):
         :func:`~.VectorFunctionSpace` or :func:`~.TensorFunctionSpace`
         this returns a proxy object indexing the ith component of the space,
         suitable for use in boundary condition application."""
-        if len(self.function_space()) == 1:
-            return self._components[i]
-        return self.subfunctions[i]
+        mixed = type(self.function_space().ufl_element()) is MixedElement
+        data = self.subfunctions if mixed else self._components
+        return data[i]
 
     def function_space(self):
         r"""Return the :class:`.FunctionSpace`, or :class:`.MixedFunctionSpace`
@@ -172,7 +177,7 @@ class Cofunction(ufl.Cofunction, FunctionMixin):
 
     @PETSc.Log.EventDecorator()
     @utils.known_pyop2_safe
-    def assign(self, expr, subset=None):
+    def assign(self, expr, subset=None, expr_from_assemble=False):
         r"""Set the :class:`Cofunction` value to the pointwise value of
         expr. expr may only contain :class:`Cofunction`\s on the same
         :class:`.FunctionSpace` as the :class:`Cofunction` being assigned to.
@@ -188,6 +193,11 @@ class Cofunction(ufl.Cofunction, FunctionMixin):
         If present, subset must be an :class:`pyop2.types.set.Subset` of this
         :class:`Cofunction`'s ``node_set``.  The expression will then
         only be assigned to the nodes on that subset.
+
+        The `expr_from_assemble` optional argument indicates whether the
+        expression results from an assemble operation performed within the
+        current method. `expr_from_assemble` is required for the
+        `CofunctionAssignBlock`.
         """
         expr = ufl.as_ufl(expr)
         if isinstance(expr, ufl.classes.Zero):
@@ -198,18 +208,31 @@ class Cofunction(ufl.Cofunction, FunctionMixin):
               and expr.function_space() == self.function_space()):
             # do not annotate in case of self assignment
             if annotate_tape() and self != expr:
+                if subset is not None:
+                    raise NotImplementedError("Cofunction subset assignment "
+                                              "annotation is not supported.")
                 self.block_variable = self.create_block_variable()
-                self.block_variable._checkpoint = DelegatedFunctionCheckpoint(expr.block_variable)
+                self.block_variable._checkpoint = DelegatedFunctionCheckpoint(
+                    expr.block_variable)
+                get_working_tape().add_block(
+                    CofunctionAssignBlock(
+                        self, expr, rhs_from_assemble=expr_from_assemble)
+                )
+
             expr.dat.copy(self.dat, subset=subset)
             return self
         elif isinstance(expr, BaseForm):
-            # Enable c.assign(B) where c is a Cofunction and B an appropriate BaseForm object.
-            # If annotation is enabled, the following operation will result in an assemble block on the
-            # Pyadjoint tape.
+            # Enable c.assign(B) where c is a Cofunction and B an appropriate
+            # BaseForm object. If annotation is enabled, the following
+            # operation will result in an assemble block on the Pyadjoint tape.
             assembled_expr = firedrake.assemble(expr)
-            return self.assign(assembled_expr, subset=subset)
-
-        raise ValueError('Cannot assign %s' % expr)
+            return self.assign(
+                assembled_expr, subset=subset,
+                expr_from_assemble=True)
+        else:
+            from firedrake.assign import Assigner
+            Assigner(self, expr, subset).assign()
+        return self
 
     def riesz_representation(self, riesz_map='L2', **solver_options):
         """Return the Riesz representation of this :class:`Cofunction` with respect to the given Riesz map.
@@ -305,6 +328,12 @@ class Cofunction(ufl.Cofunction, FunctionMixin):
         return vector.Vector(self)
 
     @property
+    def cell_set(self):
+        r"""The :class:`pyop2.types.set.Set` of cells for the mesh on which this
+        :class:`Cofunction` is defined."""
+        return self.function_space()._mesh.cell_set
+
+    @property
     def node_set(self):
         r"""A :class:`pyop2.types.set.Set` containing the nodes of this
         :class:`Cofunction`. One or (for rank-1 and 2
@@ -312,6 +341,12 @@ class Cofunction(ufl.Cofunction, FunctionMixin):
         at each node.
         """
         return self.function_space().node_set
+
+    @property
+    def dof_dset(self):
+        r"""A :class:`pyop2.types.dataset.DataSet` containing the degrees of freedom of
+        this :class:`Cofunction`."""
+        return self.function_space().dof_dset
 
     def ufl_id(self):
         return self.uid

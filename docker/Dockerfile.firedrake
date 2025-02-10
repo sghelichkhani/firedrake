@@ -7,18 +7,22 @@ WORKDIR /home/firedrake
 
 # PETSC_ARCH inherited from firedrakeproject/firedrake-vanilla
 
+ARG EXTRA_INSTALL_FLAGS=""
+
 # Now install extra Firedrake components.
 RUN bash -c "source firedrake/bin/activate; \
     firedrake-update \
         --documentation-dependencies \
-        --netgen \
+        --jax \
         --slepc \
-        --install femlium \
+        --torch \
+        --install asQ \
         --install defcon \
         --install fascd \
+        --install femlium \
         --install gadopt \
         --install gusto \
         --install icepack \
         --install irksome \
-        --install asQ \
-        --install thetis"
+        --install thetis \
+        ${EXTRA_INSTALL_FLAGS}"
