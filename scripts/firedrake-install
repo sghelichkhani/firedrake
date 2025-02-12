@@ -1794,6 +1794,7 @@ if mode == "install":
     # Install VTK
     if not args.no_vtk:
         log.info("Pip installing VTK to venv")
+        run_pip_install_wrap(["scikit-build-core"], {})
         run_pip_install_wrap(["vtk>=9.0.1"], {})
 
     if sys.version_info[:2] >= (3, 9):
