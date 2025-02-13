@@ -28,7 +28,7 @@ import firedrake.cython.extrusion_numbering as extnum
 import firedrake.extrusion_utils as eutils
 import firedrake.cython.spatialindex as spatialindex
 import firedrake.utils as utils
-from firedrake.utils import IntType, RealType
+from firedrake.utils import as_cstr, IntType, RealType
 from firedrake.logging import info_red
 from firedrake.parameters import parameters
 from firedrake.petsc import (
@@ -36,6 +36,7 @@ from firedrake.petsc import (
 )
 from firedrake.adjoint_utils import MeshGeometryMixin
 from pyadjoint import stop_annotating
+import gem
 
 try:
     import netgen
@@ -44,6 +45,7 @@ except ImportError:
     ngsPETSc = None
 # Only for docstring
 import mpi4py  # noqa: F401
+from finat.element_factory import as_fiat_cell
 
 
 __all__ = [
@@ -51,7 +53,9 @@ __all__ = [
     'SubDomainData', 'unmarked', 'DistributedMeshOverlapType',
     'DEFAULT_MESH_NAME', 'MeshGeometry', 'MeshTopology',
     'AbstractMeshTopology', 'ExtrudedMeshTopology', 'VertexOnlyMeshTopology',
-    'VertexOnlyMeshMissingPointsError']
+    'VertexOnlyMeshMissingPointsError',
+    'Submesh'
+]
 
 
 _cells = {
@@ -62,10 +66,10 @@ _cells = {
 }
 
 
-_supported_embedded_cell_types = [ufl.Cell('interval', 2),
-                                  ufl.Cell('triangle', 3),
-                                  ufl.Cell("quadrilateral", 3),
-                                  ufl.TensorProductCell(ufl.Cell('interval'), ufl.Cell('interval'), geometric_dimension=3)]
+_supported_embedded_cell_types_and_gdims = [('interval', 2),
+                                            ('triangle', 3),
+                                            ("quadrilateral", 3),
+                                            ("interval * interval", 3)]
 
 
 unmarked = -1
@@ -73,6 +77,23 @@ unmarked = -1
 
 DEFAULT_MESH_NAME = "_".join(["firedrake", "default"])
 """The default name of the mesh."""
+
+
+def _generate_default_submesh_name(name):
+    """Generate the default submesh name from the mesh name.
+
+    Parameters
+    ----------
+    name : str
+        Name of the parent mesh.
+
+    Returns
+    -------
+    str
+        Default submesh name.
+
+    """
+    return "_".join([name, "submesh"])
 
 
 def _generate_default_mesh_coordinates_name(name):
@@ -297,6 +318,44 @@ class _Facets(object):
         """Map from facets to cells."""
         return op2.Map(self.set, self.mesh.cell_set, self._rank, self.facet_cell,
                        "facet_to_cell_map")
+
+    @utils.cached_property
+    def local_facet_orientation_dat(self):
+        """Dat for the local facet orientations."""
+        dtype = gem.uint_type
+        # Make a map from cell to facet orientations.
+        fiat_cell = as_fiat_cell(self.mesh.ufl_cell())
+        topo = fiat_cell.topology
+        num_entities = [0]
+        for d in range(len(topo)):
+            num_entities.append(len(topo[d]))
+        offsets = np.cumsum(num_entities)
+        local_facet_start = offsets[-3]
+        local_facet_end = offsets[-2]
+        map_from_cell_to_facet_orientations = self.mesh.entity_orientations[:, local_facet_start:local_facet_end]
+        # Make output data;
+        # this is a map from an exterior/interior facet to the corresponding local facet orientation/orientations.
+        # Halo data are required by design, but not actually used.
+        # -- Reshape as (-1, self._rank) to uniformly handle exterior and interior facets.
+        data = np.empty_like(self.local_facet_dat.data_ro_with_halos).reshape((-1, self._rank))
+        data.fill(np.iinfo(dtype).max)
+        # Set local facet orientations on the block corresponding to the owned facets; i.e., data[:shape[0], :] below.
+        local_facets = self.local_facet_dat.data_ro  # do not need halos.
+        # -- Reshape as (-1, self._rank) to uniformly handle exterior and interior facets.
+        local_facets = local_facets.reshape((-1, self._rank))
+        shape = local_facets.shape
+        map_from_owned_facet_to_cells = self.facet_cell[:shape[0], :]
+        data[:shape[0], :] = np.take_along_axis(
+            map_from_cell_to_facet_orientations[map_from_owned_facet_to_cells],
+            local_facets.reshape(shape + (1, )),  # reshape as required by take_along_axis.
+            axis=2,
+        ).reshape(shape)
+        return op2.Dat(
+            self.local_facet_dat.dataset,
+            data,
+            dtype,
+            f"{self.mesh.name}_{self.kind}_local_facet_orientation"
+        )
 
 
 @PETSc.Log.EventDecorator()
@@ -595,6 +654,8 @@ class AbstractMeshTopology(object, metaclass=abc.ABCMeta):
         # To set, do e.g.
         # target_mesh._parallel_compatible = {weakref.ref(source_mesh)}
         self._parallel_compatible = None
+        # submesh
+        self.submesh_parent = None
 
     layers = None
     """No layers on unstructured mesh"""
@@ -929,6 +990,123 @@ class AbstractMeshTopology(object, metaclass=abc.ABCMeta):
     def extruded_periodic(self):
         return self.cell_set._extruded_periodic
 
+    # submesh
+
+    @utils.cached_property
+    def submesh_ancesters(self):
+        """Tuple of submesh ancesters."""
+        if self.submesh_parent:
+            return (self, ) + self.submesh_parent.submesh_ancesters
+        else:
+            return (self, )
+
+    def submesh_youngest_common_ancester(self, other):
+        """Return the youngest common ancester of self and other.
+
+        Parameters
+        ----------
+        other : AbstractMeshTopology
+            The other mesh.
+
+        Returns
+        -------
+        AbstractMeshTopology or None
+            Youngest common ancester or None if not found.
+
+        """
+        # self --- ... --- m --- common --- common --- common
+        #                          /
+        #       other --- ... --- m
+        self_ancesters = list(self.submesh_ancesters)
+        other_ancesters = list(other.submesh_ancesters)
+        c = None
+        while self_ancesters and other_ancesters:
+            a = self_ancesters.pop()
+            b = other_ancesters.pop()
+            if a is b:
+                c = a
+            else:
+                break
+        return c
+
+    def submesh_map_child_parent(self, source_integral_type, source_subset_points, reverse=False):
+        """Return the map from submesh child entities to submesh parent entities or its reverse.
+
+        Parameters
+        ----------
+        source_integral_type : str
+            Integral type on the source mesh.
+        source_subset_points : numpy.ndarray
+            Subset points on the source mesh.
+        reverse : bool
+            If True, return the map from parent entities to child entities.
+
+        Returns
+        -------
+        tuple
+           (map from source to target, integral type on the target mesh, subset points on the target mesh).
+
+        """
+        raise NotImplementedError(f"Not implemented for {type(self)}")
+
+    def submesh_map_composed(self, other, other_integral_type, other_subset_points):
+        """Create entity-entity map from ``other`` to `self`.
+
+        Parameters
+        ----------
+        other : AbstractMeshTopology
+            Base mesh topology.
+        other_integral_type : str
+            Integral type on ``other``.
+        other_subset_points : numpy.ndarray
+            Subset points on ``other``; only used to identify (facet) integral_type on ``self``.
+
+        Returns
+        -------
+        tuple
+            Tuple of `op2.ComposedMap` from other to self, integral_type on self, and points on self.
+
+        """
+        common = self.submesh_youngest_common_ancester(other)
+        if common is None:
+            raise ValueError(f"Unable to create composed map between (sub)meshes: {self} and {other} are unrelated")
+        maps = []
+        integral_type = other_integral_type
+        subset_points = other_subset_points
+        aa = other.submesh_ancesters
+        for a in aa[:aa.index(common)]:
+            m, integral_type, subset_points = a.submesh_map_child_parent(integral_type, subset_points)
+            maps.append(m)
+        bb = self.submesh_ancesters
+        for b in reversed(bb[:bb.index(common)]):
+            m, integral_type, subset_points = b.submesh_map_child_parent(integral_type, subset_points, reverse=True)
+            maps.append(m)
+        return op2.ComposedMap(*reversed(maps)), integral_type, subset_points
+
+    # trans mesh
+
+    def trans_mesh_entity_map(self, base_mesh, base_integral_type, base_subdomain_id, base_all_integer_subdomain_ids):
+        """Create entity-entity (composed) map from base_mesh to `self`.
+
+        Parameters
+        ----------
+        base_mesh : AbstractMeshTopology
+            Base mesh topology.
+        base_integral_type : str
+            Integral type on ``base_mesh``.
+        base_subdomain_id : int
+            Subdomain ID on ``base_mesh``.
+        base_all_integer_subdomain_ids : tuple
+            ``all_integer_subdomain_ids`` corresponding to ``base_mesh`` and ``base_integral_type``.
+
+        Returns
+        -------
+        tuple
+            `tuple` of `op2.ComposedMap` from base_mesh to `self` and integral_type on `self`.
+
+        """
+        raise NotImplementedError(f"Not implemented for {type(self)}")
+
 
 class MeshTopology(AbstractMeshTopology):
     """A representation of mesh topology implemented on a PETSc DMPlex."""
@@ -1067,7 +1245,7 @@ class MeshTopology(AbstractMeshTopology):
         else:
             # No reordering
             reordering = None
-        return dmcommon.plex_renumbering(self.topology_dm, self._entity_classes, reordering)[0]
+        return dmcommon.plex_renumbering(self.topology_dm, self._entity_classes, reordering)
 
     @utils.cached_property
     def cell_closure(self):
@@ -1084,7 +1262,13 @@ class MeshTopology(AbstractMeshTopology):
 
         cell = self.ufl_cell()
         assert tdim == cell.topological_dimension()
-        if cell.is_simplex():
+        if self.submesh_parent is not None:
+            return dmcommon.submesh_create_cell_closure_cell_submesh(plex,
+                                                                     self.submesh_parent.topology_dm,
+                                                                     cell_numbering,
+                                                                     self.submesh_parent._cell_numbering,
+                                                                     self.submesh_parent.cell_closure)
+        elif cell.is_simplex():
             topology = FIAT.ufc_cell(cell).get_topology()
             entity_per_cell = np.zeros(len(topology), dtype=IntType)
             for d, ents in topology.items():
@@ -1293,8 +1477,8 @@ class MeshTopology(AbstractMeshTopology):
         elem = tV.ufl_element()
         if tV.mesh() is not self:
             raise RuntimeError(f"tf must be defined on {self}: {tf.mesh()} is not {self}")
-        if elem.value_shape != ():
-            raise RuntimeError(f"tf must be scalar: {elem.value_shape} != ()")
+        if elem.reference_value_shape != ():
+            raise RuntimeError(f"tf must be scalar: {elem.reference_value_shape} != ()")
         if elem.family() in {"Discontinuous Lagrange", "DQ"} and elem.degree() == 0:
             # cells
             height = 0
@@ -1315,6 +1499,174 @@ class MeshTopology(AbstractMeshTopology):
         section = tV.dm.getSection()
         array = tf.dat.data_ro_with_halos.real.astype(IntType)
         dmcommon.mark_points_with_function_array(plex, section, height, array, label, label_value)
+
+    # submesh
+
+    def _submesh_make_entity_entity_map(self, from_set, to_set, from_points, to_points, child_parent_map):
+        assert from_set.total_size == len(from_points)
+        assert to_set.total_size == len(to_points)
+        with self.topology_dm.getSubpointIS() as subpoints:
+            if child_parent_map:
+                _, from_indices, to_indices = np.intersect1d(subpoints[from_points], to_points, return_indices=True)
+            else:
+                _, from_indices, to_indices = np.intersect1d(from_points, subpoints[to_points], return_indices=True)
+        values = np.full(from_set.total_size, -1, dtype=IntType)
+        values[from_indices] = to_indices
+        return op2.Map(from_set, to_set, 1, values.reshape((-1, 1)), f"{self}_submesh_map_{from_set}_{to_set}")
+
+    @utils.cached_property
+    def submesh_child_cell_parent_cell_map(self):
+        return self._submesh_make_entity_entity_map(self.cell_set, self.submesh_parent.cell_set, self.cell_closure[:, -1], self.submesh_parent.cell_closure[:, -1], True)
+
+    @utils.cached_property
+    def submesh_child_exterior_facet_parent_exterior_facet_map(self):
+        return self._submesh_make_entity_entity_map(self.exterior_facets.set, self.submesh_parent.exterior_facets.set, self.exterior_facets.facets, self.submesh_parent.exterior_facets.facets, True)
+
+    @utils.cached_property
+    def submesh_child_exterior_facet_parent_interior_facet_map(self):
+        return self._submesh_make_entity_entity_map(self.exterior_facets.set, self.submesh_parent.interior_facets.set, self.exterior_facets.facets, self.submesh_parent.interior_facets.facets, True)
+
+    @utils.cached_property
+    def submesh_child_interior_facet_parent_exterior_facet_map(self):
+        raise RuntimeError("Should never happen")
+
+    @utils.cached_property
+    def submesh_child_interior_facet_parent_interior_facet_map(self):
+        return self._submesh_make_entity_entity_map(self.interior_facets.set, self.submesh_parent.interior_facets.set, self.interior_facets.facets, self.submesh_parent.interior_facets.facets, True)
+
+    @utils.cached_property
+    def submesh_parent_cell_child_cell_map(self):
+        return self._submesh_make_entity_entity_map(self.submesh_parent.cell_set, self.cell_set, self.submesh_parent.cell_closure[:, -1], self.cell_closure[:, -1], False)
+
+    @utils.cached_property
+    def submesh_parent_exterior_facet_child_exterior_facet_map(self):
+        return self._submesh_make_entity_entity_map(self.submesh_parent.exterior_facets.set, self.exterior_facets.set, self.submesh_parent.exterior_facets.facets, self.exterior_facets.facets, False)
+
+    @utils.cached_property
+    def submesh_parent_exterior_facet_child_interior_facet_map(self):
+        raise RuntimeError("Should never happen")
+
+    @utils.cached_property
+    def submesh_parent_interior_facet_child_exterior_facet_map(self):
+        return self._submesh_make_entity_entity_map(self.submesh_parent.interior_facets.set, self.exterior_facets.set, self.submesh_parent.interior_facets.facets, self.exterior_facets.facets, False)
+
+    @utils.cached_property
+    def submesh_parent_interior_facet_child_interior_facet_map(self):
+        return self._submesh_make_entity_entity_map(self.submesh_parent.interior_facets.set, self.interior_facets.set, self.submesh_parent.interior_facets.facets, self.interior_facets.facets, False)
+
+    def submesh_map_child_parent(self, source_integral_type, source_subset_points, reverse=False):
+        """Return the map from submesh child entities to submesh parent entities or its reverse.
+
+        Parameters
+        ----------
+        source_integral_type : str
+            Integral type on the source mesh.
+        source_subset_points : numpy.ndarray
+            Subset points on the source mesh.
+        reverse : bool
+            If True, return the map from parent entities to child entities.
+
+        Returns
+        -------
+        tuple
+           (map from source to target, integral type on the target mesh, subset points on the target mesh).
+
+        """
+        if self.submesh_parent is None:
+            raise RuntimeError("Must only be called on submesh")
+        if reverse:
+            source = self.submesh_parent
+            target = self
+        else:
+            source = self
+            target = self.submesh_parent
+        target_dim = target.topology_dm.getDimension()
+        source_dim = source.topology_dm.getDimension()
+        if source_dim != target_dim:
+            raise NotImplementedError(f"Not implemented for (source_dim, target_dim) == ({source_dim}, {target_dim})")
+        if source_integral_type == "cell":
+            target_integral_type = "cell"
+            target_subset_points = None
+        elif source_integral_type in ["interior_facet", "exterior_facet"]:
+            with self.topology_dm.getSubpointIS() as subpoints:
+                if reverse:
+                    _, target_indices_int, source_indices_int = np.intersect1d(subpoints[target.interior_facets.facets], source_subset_points, return_indices=True)
+                    _, target_indices_ext, source_indices_ext = np.intersect1d(subpoints[target.exterior_facets.facets], source_subset_points, return_indices=True)
+                else:
+                    target_subset_points = subpoints[source_subset_points]
+                    _, target_indices_int, source_indices_int = np.intersect1d(target.interior_facets.facets, target_subset_points, return_indices=True)
+                    _, target_indices_ext, source_indices_ext = np.intersect1d(target.exterior_facets.facets, target_subset_points, return_indices=True)
+            n_int = len(source_indices_int)
+            n_ext = len(source_indices_ext)
+            n_int_max = self._comm.allreduce(n_int, op=MPI.MAX)
+            n_ext_max = self._comm.allreduce(n_ext, op=MPI.MAX)
+            if n_int_max > 0:
+                if n_ext_max != 0:
+                    raise RuntimeError(f"integral_type on the target mesh is interior facet, but {n_ext_max} exterior facet entities are also included")
+                if n_int > len(source_subset_points):
+                    raise RuntimeError("Found inconsistent data")
+                target_integral_type = "interior_facet"
+            elif n_ext_max > 0:
+                if n_int_max != 0:
+                    raise RuntimeError(f"integral_type on the target mesh is exterior facet, but {n_int_max} interior facet entities are also included")
+                if n_ext > len(source_subset_points):
+                    raise RuntimeError("Found inconsistent data")
+                target_integral_type = "exterior_facet"
+            else:
+                raise RuntimeError("Can not find a map from source to target.")
+            if reverse:
+                if target_integral_type == "interior_facet":
+                    target_subset_points = target.interior_facets.facets[target_indices_int]
+                elif target_integral_type == "exterior_facet":
+                    target_subset_points = target.exterior_facets.facets[target_indices_ext]
+        else:
+            raise NotImplementedError(f"Not implemented for (source_dim, target_dim, source_integral_type) == ({source_dim}, {target_dim}, {source_integral_type})")
+        if reverse:
+            map_ = getattr(self, f"submesh_parent_{source_integral_type}_child_{target_integral_type}_map")
+        else:
+            map_ = getattr(self, f"submesh_child_{source_integral_type}_parent_{target_integral_type}_map")
+        return map_, target_integral_type, target_subset_points
+
+    # trans mesh
+
+    def trans_mesh_entity_map(self, base_mesh, base_integral_type, base_subdomain_id, base_all_integer_subdomain_ids):
+        """Create entity-entity (composed) map from base_mesh to `self`.
+
+        Parameters
+        ----------
+        base_mesh : AbstractMeshTopology
+            Base mesh topology.
+        base_integral_type : str
+            Integral type on ``base_mesh``.
+        base_subdomain_id : int
+            Subdomain ID on ``base_mesh``.
+        base_all_integer_subdomain_ids : tuple
+            ``all_integer_subdomain_ids`` corresponding to ``base_mesh`` and ``base_integral_type``.
+
+        Returns
+        -------
+        tuple
+            `tuple` of `op2.ComposedMap` from base_mesh to `self` and integral_type on `self`.
+
+        """
+        common = self.submesh_youngest_common_ancester(base_mesh)
+        if common is None:
+            raise NotImplementedError(f"Currently only implemented for (sub)meshes in the same family: got {self} and {base_mesh}")
+        elif base_mesh is self:
+            raise NotImplementedError("Currenlty can not return identity map")
+        else:
+            if base_integral_type == "cell":
+                base_subset_points = None
+            elif base_integral_type in ["interior_facet", "exterior_facet"]:
+                base_subset = base_mesh.measure_set(base_integral_type, base_subdomain_id, all_integer_subdomain_ids=base_all_integer_subdomain_ids)
+                if base_integral_type == "interior_facet":
+                    base_subset_points = base_mesh.interior_facets.facets[base_subset.indices]
+                elif base_integral_type == "exterior_facet":
+                    base_subset_points = base_mesh.exterior_facets.facets[base_subset.indices]
+            else:
+                raise NotImplementedError(f"Unknown integration type : {base_integral_type}")
+            composed_map, integral_type, _ = self.submesh_map_composed(base_mesh, base_integral_type, base_subset_points)
+            return composed_map, integral_type
 
 
 class ExtrudedMeshTopology(MeshTopology):
@@ -1380,6 +1732,8 @@ class ExtrudedMeshTopology(MeshTopology):
         else:
             self.variable_layers = False
         self.cell_set = op2.ExtrudedSet(mesh.cell_set, layers=layers, extruded_periodic=periodic)
+        # submesh
+        self.submesh_parent = None
 
     @utils.cached_property
     def _ufl_cell(self):
@@ -1612,7 +1966,7 @@ class VertexOnlyMeshTopology(AbstractMeshTopology):
         if reorder:
             swarm = self.topology_dm
             parent = self._parent_mesh.topology_dm
-            swarm_parent_cell_nums = swarm.getField("DMSwarm_cellid")
+            swarm_parent_cell_nums = swarm.getField("DMSwarm_cellid").ravel()
             parent_renum = self._parent_mesh._dm_renumbering.getIndices()
             pStart, _ = parent.getChart()
             parent_renum_inv = np.empty_like(parent_renum)
@@ -1625,7 +1979,7 @@ class VertexOnlyMeshTopology(AbstractMeshTopology):
             perm_is.setIndices(perm)
             return perm_is
         else:
-            return dmcommon.plex_renumbering(self.topology_dm, self._entity_classes, None)[0]
+            return dmcommon.plex_renumbering(self.topology_dm, self._entity_classes, None)
 
     @utils.cached_property  # TODO: Recalculate if mesh moves
     def cell_closure(self):
@@ -1709,7 +2063,7 @@ class VertexOnlyMeshTopology(AbstractMeshTopology):
         """Return a list of parent mesh cells numbers in vertex only
         mesh cell order.
         """
-        cell_parent_cell_list = np.copy(self.topology_dm.getField("parentcellnum"))
+        cell_parent_cell_list = np.copy(self.topology_dm.getField("parentcellnum").ravel())
         self.topology_dm.restoreField("parentcellnum")
         return cell_parent_cell_list[self.cell_closure[:, -1]]
 
@@ -1728,7 +2082,7 @@ class VertexOnlyMeshTopology(AbstractMeshTopology):
         """
         if not isinstance(self._parent_mesh, ExtrudedMeshTopology):
             raise AttributeError("Parent mesh is not extruded")
-        cell_parent_base_cell_list = np.copy(self.topology_dm.getField("parentcellbasenum"))
+        cell_parent_base_cell_list = np.copy(self.topology_dm.getField("parentcellbasenum").ravel())
         self.topology_dm.restoreField("parentcellbasenum")
         return cell_parent_base_cell_list[self.cell_closure[:, -1]]
 
@@ -1749,7 +2103,7 @@ class VertexOnlyMeshTopology(AbstractMeshTopology):
         """
         if not isinstance(self._parent_mesh, ExtrudedMeshTopology):
             raise AttributeError("Parent mesh is not extruded.")
-        cell_parent_extrusion_height_list = np.copy(self.topology_dm.getField("parentcellextrusionheight"))
+        cell_parent_extrusion_height_list = np.copy(self.topology_dm.getField("parentcellextrusionheight").ravel())
         self.topology_dm.restoreField("parentcellextrusionheight")
         return cell_parent_extrusion_height_list[self.cell_closure[:, -1]]
 
@@ -1769,7 +2123,7 @@ class VertexOnlyMeshTopology(AbstractMeshTopology):
     @utils.cached_property  # TODO: Recalculate if mesh moves
     def cell_global_index(self):
         """Return a list of unique cell IDs in vertex only mesh cell order."""
-        cell_global_index = np.copy(self.topology_dm.getField("globalindex"))
+        cell_global_index = np.copy(self.topology_dm.getField("globalindex").ravel())
         self.topology_dm.restoreField("globalindex")
         return cell_global_index
 
@@ -1804,8 +2158,8 @@ class VertexOnlyMeshTopology(AbstractMeshTopology):
         # ilocal = None -> leaves are swarm points [0, 1, 2, ...).
         # ilocal can also be Firedrake cell numbers.
         sf = PETSc.SF().create(comm=swarm.comm)
-        input_ranks = swarm.getField("inputrank")
-        input_indices = swarm.getField("inputindex")
+        input_ranks = swarm.getField("inputrank").ravel()
+        input_indices = swarm.getField("inputindex").ravel()
         nleaves = len(input_ranks)
         if ilocal is not None and nleaves != len(ilocal):
             swarm.restoreField("inputrank")
@@ -1912,6 +2266,12 @@ class MeshGeometry(ufl.Mesh, MeshGeometryMixin):
         # Cache mesh object on the coordinateless coordinates function
         coordinates._as_mesh_geometry = weakref.ref(self)
 
+        # submesh
+        self.submesh_parent = None
+
+        self._spatial_index = None
+        self._saved_coordinate_dat_version = coordinates.dat.dat_version
+
     def _ufl_signature_data_(self, *args, **kwargs):
         return (type(self), self.extruded, self.variable_layers,
                 super()._ufl_signature_data_(*args, **kwargs))
@@ -1946,7 +2306,7 @@ class MeshGeometry(ufl.Mesh, MeshGeometryMixin):
             self.topology.init()
             coordinates_fs = functionspace.FunctionSpace(self.topology, self.ufl_coordinate_element())
             coordinates_data = dmcommon.reordered_coords(topology.topology_dm, coordinates_fs.dm.getDefaultSection(),
-                                                         (self.num_vertices(), self.ufl_coordinate_element().cell.geometric_dimension()))
+                                                         (self.num_vertices(), self.geometric_dimension()))
             coordinates = function.CoordinatelessFunction(coordinates_fs,
                                                           val=coordinates_data,
                                                           name=_generate_default_mesh_coordinates_name(self.name))
@@ -2091,12 +2451,9 @@ values from f.)"""
 
         Use this if you move the mesh (for example by reassigning to
         the coordinate field)."""
-        try:
-            del self.spatial_index
-        except AttributeError:
-            pass
+        self._spatial_index = None
 
-    @utils.cached_property
+    @property
     def spatial_index(self):
         """Spatial index to quickly find which cell contains a given point.
 
@@ -2109,11 +2466,16 @@ values from f.)"""
         can be found.
 
         """
-
         from firedrake import function, functionspace
         from firedrake.parloops import par_loop, READ, MIN, MAX
 
-        gdim = self.ufl_cell().geometric_dimension()
+        if (
+            self._spatial_index
+            and self.coordinates.dat.dat_version == self._saved_coordinate_dat_version
+        ):
+            return self._spatial_index
+
+        gdim = self.geometric_dimension()
         if gdim <= 1:
             info_red("libspatialindex does not support 1-dimension, falling back on brute force.")
             return None
@@ -2174,10 +2536,12 @@ values from f.)"""
         coords_max = coords_mid + (tolerance + 0.5)*d
 
         # Build spatial index
-        return spatialindex.from_regions(coords_min, coords_max)
+        self._spatial_index = spatialindex.from_regions(coords_min, coords_max)
+        self._saved_coordinate_dat_version = self.coordinates.dat.dat_version
+        return self._spatial_index
 
     @PETSc.Log.EventDecorator()
-    def locate_cell(self, x, tolerance=None):
+    def locate_cell(self, x, tolerance=None, cell_ignore=None):
         """Locate cell containing a given point.
 
         :arg x: point coordinates
@@ -2185,12 +2549,13 @@ values from f.)"""
             Default is this mesh's :attr:`tolerance` property. Changing
             this from default will cause the spatial index to be rebuilt which
             can take some time.
+        :kwarg cell_ignore: Cell number to ignore in the search.
         :returns: cell number (int), or None (if the point is not
             in the domain)
         """
-        return self.locate_cell_and_reference_coordinate(x, tolerance=tolerance)[0]
+        return self.locate_cell_and_reference_coordinate(x, tolerance=tolerance, cell_ignore=cell_ignore)[0]
 
-    def locate_reference_coordinate(self, x, tolerance=None):
+    def locate_reference_coordinate(self, x, tolerance=None, cell_ignore=None):
         """Get reference coordinates of a given point in its cell. Which
         cell the point is in can be queried with the locate_cell method.
 
@@ -2199,12 +2564,13 @@ values from f.)"""
             Default is this mesh's :attr:`tolerance` property. Changing
             this from default will cause the spatial index to be rebuilt which
             can take some time.
+        :kwarg cell_ignore: Cell number to ignore in the search.
         :returns: reference coordinates within cell (numpy array) or
             None (if the point is not in the domain)
         """
-        return self.locate_cell_and_reference_coordinate(x, tolerance=tolerance)[1]
+        return self.locate_cell_and_reference_coordinate(x, tolerance=tolerance, cell_ignore=cell_ignore)[1]
 
-    def locate_cell_and_reference_coordinate(self, x, tolerance=None):
+    def locate_cell_and_reference_coordinate(self, x, tolerance=None, cell_ignore=None):
         """Locate cell containing a given point and the reference
         coordinates of the point within the cell.
 
@@ -2213,6 +2579,7 @@ values from f.)"""
             Default is this mesh's :attr:`tolerance` property. Changing
             this from default will cause the spatial index to be rebuilt which
             can take some time.
+        :kwarg cell_ignore: Cell number to ignore in the search.
         :returns: tuple either
             (cell number, reference coordinates) of type (int, numpy array),
             or, when point is not in the domain, (None, None).
@@ -2221,12 +2588,12 @@ values from f.)"""
         if x.size != self.geometric_dimension():
             raise ValueError("Point must have the same geometric dimension as the mesh")
         x = x.reshape((1, self.geometric_dimension()))
-        cells, ref_coords, _ = self.locate_cells_ref_coords_and_dists(x, tolerance=tolerance)
+        cells, ref_coords, _ = self.locate_cells_ref_coords_and_dists(x, tolerance=tolerance, cells_ignore=[[cell_ignore]])
         if cells[0] == -1:
             return None, None
         return cells[0], ref_coords[0]
 
-    def locate_cells_ref_coords_and_dists(self, xs, tolerance=None):
+    def locate_cells_ref_coords_and_dists(self, xs, tolerance=None, cells_ignore=None):
         """Locate cell containing a given point and the reference
         coordinates of the point within the cell.
 
@@ -2235,6 +2602,11 @@ values from f.)"""
             Default is this mesh's :attr:`tolerance` property. Changing
             this from default will cause the spatial index to be rebuilt which
             can take some time.
+        :kwarg cells_ignore: Cell numbers to ignore in the search for each
+            point in xs. Shape should be (npoints, n_ignore_pts). Each column
+            corresponds to a single coordinate in xs. To not ignore any cells,
+            pass None. To ensure a full cell search for any given point, set
+            the corresponding entries to -1.
         :returns: tuple either
             (cell numbers array, reference coordinates array, ref_cell_dists_l1 array)
             of type
@@ -2255,6 +2627,13 @@ values from f.)"""
             raise ValueError("Point coordinate dimension does not match mesh geometric dimension")
         Xs = np.empty_like(xs)
         npoints = len(xs)
+        if cells_ignore is None or cells_ignore[0][0] is None:
+            cells_ignore = np.full((npoints, 1), -1, dtype=IntType, order="C")
+        else:
+            cells_ignore = np.asarray(cells_ignore, dtype=IntType, order="C")
+        if cells_ignore.shape[0] != npoints:
+            raise ValueError("Number of cells to ignore does not match number of points")
+        assert cells_ignore.shape == (npoints, cells_ignore.shape[1])
         ref_cell_dists_l1 = np.empty(npoints, dtype=utils.RealType)
         cells = np.empty(npoints, dtype=IntType)
         assert xs.size == npoints * self.geometric_dimension()
@@ -2263,7 +2642,9 @@ values from f.)"""
                                              Xs.ctypes.data_as(ctypes.POINTER(ctypes.c_double)),
                                              ref_cell_dists_l1.ctypes.data_as(ctypes.POINTER(ctypes.c_double)),
                                              cells.ctypes.data_as(ctypes.POINTER(ctypes.c_int)),
-                                             npoints)
+                                             npoints,
+                                             cells_ignore.shape[1],
+                                             cells_ignore)
         return cells, Xs, ref_cell_dists_l1
 
     def _c_locator(self, tolerance=None):
@@ -2276,12 +2657,13 @@ values from f.)"""
         try:
             return cache[tolerance]
         except KeyError:
+            IntTypeC = as_cstr(IntType)
             src = pq_utils.src_locate_cell(self, tolerance=tolerance)
             src += dedent(f"""
-                int locator(struct Function *f, double *x, double *X, double *ref_cell_dists_l1, int *cells, size_t npoints)
+                int locator(struct Function *f, double *x, double *X, double *ref_cell_dists_l1, {IntTypeC} *cells, {IntTypeC} npoints, size_t ncells_ignore, int* cells_ignore)
                 {{
-                    size_t j = 0;  /* index into x and X */
-                    for(size_t i=0; i<npoints; i++) {{
+                    {IntTypeC} j = 0;  /* index into x and X */
+                    for({IntTypeC} i=0; i<npoints; i++) {{
                         /* i is the index into cells and ref_cell_dists_l1 */
 
                         /* The type definitions and arguments used here are defined as
@@ -2291,7 +2673,9 @@ values from f.)"""
                         /* to_reference_coords and to_reference_coords_xtr are defined in
                         pointquery_utils.py. If they contain python calls, this loop will
                         not run at c-loop speed. */
-                        cells[i] = locate_cell(f, &x[j], {self.geometric_dimension()}, &to_reference_coords, &to_reference_coords_xtr, &temp_reference_coords, &found_reference_coords, &ref_cell_dists_l1[i]);
+                        /* cells_ignore has shape (npoints, ncells_ignore) - find the ith row */
+                        int *cells_ignore_i = cells_ignore + i*ncells_ignore;
+                        cells[i] = locate_cell(f, &x[j], {self.geometric_dimension()}, &to_reference_coords, &to_reference_coords_xtr, &temp_reference_coords, &found_reference_coords, &ref_cell_dists_l1[i], ncells_ignore, cells_ignore_i);
 
                         for (int k = 0; k < {self.geometric_dimension()}; k++) {{
                             X[j] = found_reference_coords.X[k];
@@ -2304,8 +2688,8 @@ values from f.)"""
 
             libspatialindex_so = Path(rtree.core.rt._name).absolute()
             lsi_runpath = f"-Wl,-rpath,{libspatialindex_so.parent}"
-            locator = compilation.load(
-                src, "c", "locator",
+            dll = compilation.load(
+                src, "c",
                 cppargs=[
                     f"-I{os.path.dirname(__file__)}",
                     f"-I{sys.prefix}/include",
@@ -2319,13 +2703,15 @@ values from f.)"""
                 ],
                 comm=self.comm
             )
-
+            locator = getattr(dll, "locator")
             locator.argtypes = [ctypes.POINTER(function._CFunction),
                                 ctypes.POINTER(ctypes.c_double),
                                 ctypes.POINTER(ctypes.c_double),
                                 ctypes.POINTER(ctypes.c_double),
                                 ctypes.POINTER(ctypes.c_int),
-                                ctypes.c_size_t]
+                                ctypes.c_size_t,
+                                ctypes.c_size_t,
+                                np.ctypeslib.ndpointer(ctypes.c_int, flags="C_CONTIGUOUS")]
             locator.restype = ctypes.c_int
             return cache.setdefault(tolerance, locator)
 
@@ -2386,7 +2772,7 @@ values from f.)"""
         import firedrake.function as function
         import firedrake.functionspace as functionspace
 
-        if self.ufl_cell() not in _supported_embedded_cell_types:
+        if (self.ufl_cell().cellname(), self.geometric_dimension()) not in _supported_embedded_cell_types_and_gdims:
             raise NotImplementedError('Only implemented for intervals embedded in 2d and triangles and quadrilaterals embedded in 3d')
 
         if hasattr(self, '_cell_orientations'):
@@ -2395,8 +2781,8 @@ values from f.)"""
         if not isinstance(expr, ufl.classes.Expr):
             raise TypeError("UFL expression expected!")
 
-        if expr.ufl_shape != (self.ufl_cell().geometric_dimension(), ):
-            raise ValueError(f"Mismatching shapes: expr.ufl_shape ({expr.ufl_shape}) != (self.ufl_cell().geometric_dimension(), ) (({self.ufl_cell().geometric_dimension}, ))")
+        if expr.ufl_shape != (self.geometric_dimension(), ):
+            raise ValueError(f"Mismatching shapes: expr.ufl_shape ({expr.ufl_shape}) != (self.geometric_dimension(), ) (({self.geometric_dimension}, ))")
 
         fs = functionspace.FunctionSpace(self, 'DG', 0)
         x = ufl.SpatialCoordinate(self)
@@ -2469,12 +2855,9 @@ def make_mesh_from_coordinates(coordinates, name, tolerance=0.5):
 
     V = coordinates.function_space()
     element = coordinates.ufl_element()
-    if V.rank != 1 or len(element.value_shape) != 1:
+    if V.rank != 1 or len(element.reference_value_shape) != 1:
         raise ValueError("Coordinates must be from a rank-1 FunctionSpace with rank-1 value_shape.")
     assert V.mesh().ufl_cell().topological_dimension() <= V.value_size
-    # Build coordinate element
-    cell = element.cell.reconstruct(geometric_dimension=V.value_size)
-    element = element.reconstruct(cell=cell)
 
     mesh = MeshGeometry.__new__(MeshGeometry, element, coordinates.comm)
     mesh.__init__(coordinates)
@@ -2507,11 +2890,10 @@ def make_mesh_from_mesh_topology(topology, name, tolerance=0.5):
     # TODO: meshfile might indicates higher-order coordinate element
     cell = topology.ufl_cell()
     geometric_dim = topology.topology_dm.getCoordinateDim()
-    cell = cell.reconstruct(geometric_dimension=geometric_dim)
     if not topology.topology_dm.getCoordinatesLocalized():
-        element = finat.ufl.VectorElement("Lagrange", cell, 1)
+        element = finat.ufl.VectorElement("Lagrange", cell, 1, dim=geometric_dim)
     else:
-        element = finat.ufl.VectorElement("DQ" if cell in [ufl.quadrilateral, ufl.hexahedron] else "DG", cell, 1, variant="equispaced")
+        element = finat.ufl.VectorElement("DQ" if cell in [ufl.quadrilateral, ufl.hexahedron] else "DG", cell, 1, dim=geometric_dim, variant="equispaced")
     # Create mesh object
     mesh = MeshGeometry.__new__(MeshGeometry, element, topology.comm)
     mesh._init_topology(topology)
@@ -2543,9 +2925,8 @@ def make_vom_from_vom_topology(topology, name, tolerance=0.5):
     import firedrake.function as function
 
     gdim = topology.topology_dm.getCoordinateDim()
-    tcell = topology.ufl_cell()
-    cell = tcell.reconstruct(geometric_dimension=gdim)
-    element = finat.ufl.VectorElement("DG", cell, 0)
+    cell = topology.ufl_cell()
+    element = finat.ufl.VectorElement("DG", cell, 0, dim=gdim)
     vmesh = MeshGeometry.__new__(MeshGeometry, element, topology.comm)
     vmesh._init_topology(topology)
     # Save vertex reference coordinate (within reference cell) in function
@@ -2687,9 +3068,12 @@ def Mesh(meshfile, **kwargs):
             from ngsPETSc import FiredrakeMesh
         except ImportError:
             raise ImportError("Unable to import ngsPETSc. Please ensure that ngsolve is installed and available to Firedrake.")
+        from firedrake_citations import Citations
+        Citations().register("Betteridge2024")
         netgen_flags = kwargs.get("netgen_flags", {"quad": False, "transform": None, "purify_to_tets": False})
         netgen_firedrake_mesh = FiredrakeMesh(meshfile, netgen_flags, user_comm)
         plex = netgen_firedrake_mesh.meshMap.petscPlex
+        plex.setName(_generate_default_mesh_topology_name(name))
     else:
         basename, ext = os.path.splitext(meshfile)
         if ext.lower() in ['.e', '.exo']:
@@ -2716,10 +3100,11 @@ def Mesh(meshfile, **kwargs):
                             distribution_name=kwargs.get("distribution_name"),
                             permutation_name=kwargs.get("permutation_name"),
                             comm=user_comm)
-    mesh = make_mesh_from_mesh_topology(topology, name)
     if netgen and isinstance(meshfile, netgen.libngpy._meshing.Mesh):
-        netgen_firedrake_mesh.createFromTopology(topology, name=plex.getName(), comm=user_comm)
+        netgen_firedrake_mesh.createFromTopology(topology, name=name, comm=user_comm)
         mesh = netgen_firedrake_mesh.firedrakeMesh
+    else:
+        mesh = make_mesh_from_mesh_topology(topology, name)
     mesh._tolerance = tolerance
     return mesh
 
@@ -2835,7 +3220,7 @@ def ExtrudedMesh(mesh, layers, layer_height=None, extrusion_type='uniform', peri
         pass
     elif extrusion_type in ("radial", "radial_hedgehog"):
         # do not allow radial extrusion if tdim = gdim
-        if mesh.ufl_cell().geometric_dimension() == mesh.ufl_cell().topological_dimension():
+        if mesh.geometric_dimension() == mesh.topological_dimension():
             raise RuntimeError("Cannot radially-extrude a mesh with equal geometric and topological dimension")
     else:
         # check for kernel
@@ -2855,7 +3240,7 @@ def ExtrudedMesh(mesh, layers, layer_height=None, extrusion_type='uniform', peri
     element = finat.ufl.TensorProductElement(helement, velement)
 
     if gdim is None:
-        gdim = mesh.ufl_cell().geometric_dimension() + (extrusion_type == "uniform")
+        gdim = mesh.geometric_dimension() + (extrusion_type == "uniform")
     coordinates_fs = functionspace.VectorFunctionSpace(topology, element, dim=gdim)
 
     coordinates = function.CoordinatelessFunction(coordinates_fs, name=_generate_default_mesh_coordinates_name(name))
@@ -3278,7 +3663,7 @@ def _pic_swarm_in_mesh(
     # local_points[halo_indices] (it also updates local_points[~halo_indices]`, not changing any values there).
     # If some index of local_points_reduced corresponds to a missing point, local_points_reduced[index] is not updated
     # when we reduce and it does not update any leaf data, i.e., local_points, when we bcast.
-    owners = swarm.getField("DMSwarm_rank")
+    owners = swarm.getField("DMSwarm_rank").ravel()
     halo_indices, = np.where(owners != parent_mesh.comm.rank)
     halo_indices = halo_indices.astype(IntType)
     n = coords.shape[0]
@@ -3494,13 +3879,13 @@ def _dmswarm_create(
 
     # NOTE ensure that swarm.restoreField is called for each field too!
     swarm_coords = swarm.getField("DMSwarmPIC_coor").reshape((num_vertices, gdim))
-    swarm_parent_cell_nums = swarm.getField("DMSwarm_cellid")
-    field_parent_cell_nums = swarm.getField("parentcellnum")
+    swarm_parent_cell_nums = swarm.getField("DMSwarm_cellid").ravel()
+    field_parent_cell_nums = swarm.getField("parentcellnum").ravel()
     field_reference_coords = swarm.getField("refcoord").reshape((num_vertices, tdim))
-    field_global_index = swarm.getField("globalindex")
-    field_rank = swarm.getField("DMSwarm_rank")
-    field_input_rank = swarm.getField("inputrank")
-    field_input_index = swarm.getField("inputindex")
+    field_global_index = swarm.getField("globalindex").ravel()
+    field_rank = swarm.getField("DMSwarm_rank").ravel()
+    field_input_rank = swarm.getField("inputrank").ravel()
+    field_input_index = swarm.getField("inputindex").ravel()
     swarm_coords[...] = coords
     swarm_parent_cell_nums[...] = plex_parent_cell_nums
     field_parent_cell_nums[...] = parent_cell_nums
@@ -3521,8 +3906,8 @@ def _dmswarm_create(
     swarm.restoreField("DMSwarm_cellid")
 
     if extruded:
-        field_base_parent_cell_nums = swarm.getField("parentcellbasenum")
-        field_extrusion_heights = swarm.getField("parentcellextrusionheight")
+        field_base_parent_cell_nums = swarm.getField("parentcellbasenum").ravel()
+        field_extrusion_heights = swarm.getField("parentcellextrusionheight").ravel()
         field_base_parent_cell_nums[...] = base_parent_cell_nums
         field_extrusion_heights[...] = extrusion_heights
         swarm.restoreField("parentcellbasenum")
@@ -3782,12 +4167,18 @@ def _parent_mesh_embedding(
     if parent_mesh.geometric_dimension() > parent_mesh.topological_dimension():
         # The reference coordinates contain an extra unnecessary dimension
         # which we can safely delete
-        reference_coords = reference_coords[:, :parent_mesh.topological_dimension()]
+        reference_coords = reference_coords[:, : parent_mesh.topological_dimension()]
 
     locally_visible[:] = parent_cell_nums != -1
     ranks[locally_visible] = visible_ranks[parent_cell_nums[locally_visible]]
     # see below for why np.inf is used here.
     ref_cell_dists_l1[~locally_visible] = np.inf
+
+    # ensure that points which a rank thinks it owns are always chosen in a tie
+    # break by setting the rank to be negative. If multiple ranks think they
+    # own a point then the one with the highest rank will be chosen.
+    on_this_rank = ranks == parent_mesh.comm.rank
+    ranks[on_this_rank] = -parent_mesh.comm.rank
     ref_cell_dists_l1_and_ranks = np.stack((ref_cell_dists_l1, ranks), axis=1)
 
     # In parallel there will regularly be disagreements about which cell owns a
@@ -3806,23 +4197,73 @@ def _parent_mesh_embedding(
         ref_cell_dists_l1_and_ranks, op=array_lexicographic_mpi_op
     )
 
+    # switch ranks back to positive
+    owned_ref_cell_dists_l1_and_ranks[:, 1] = np.abs(
+        owned_ref_cell_dists_l1_and_ranks[:, 1]
+    )
+    ref_cell_dists_l1_and_ranks[:, 1] = np.abs(ref_cell_dists_l1_and_ranks[:, 1])
+    ranks = np.abs(ranks)
+
+    owned_ref_cell_dists_l1 = owned_ref_cell_dists_l1_and_ranks[:, 0]
     owned_ranks = owned_ref_cell_dists_l1_and_ranks[:, 1]
 
-    # Any rows where owned_ref_cell_dists_l1_and_ranks and
-    # ref_cell_dists_l1_and_ranks differ in distance or rank correspond to
-    # points which are claimed by a cell that we cannot see. We should now
-    # update our information accordingly. This should only happen for points
-    # which we've already marked as being owned by a different rank.
-    extra_missing_points = ~np.all(
-        owned_ref_cell_dists_l1_and_ranks == ref_cell_dists_l1_and_ranks, axis=1
-    )
-    if any(owned_ranks[extra_missing_points] == parent_mesh.comm.rank):
-        raise RuntimeError(
-            "Some points have been claimed by a cell that we cannot see, "
-            "but which we think we own. This should not happen."
-        )
-    locally_visible[extra_missing_points] = False
-    parent_cell_nums[extra_missing_points] = -1
+    changed_ref_cell_dists_l1 = owned_ref_cell_dists_l1 != ref_cell_dists_l1
+    changed_ranks = owned_ranks != ranks
+
+    # If distance has changed the the point is not in local mesh partition
+    # since some other cell on another rank is closer.
+    locally_visible[changed_ref_cell_dists_l1] = False
+    parent_cell_nums[changed_ref_cell_dists_l1] = -1
+    # If the rank has changed but the distance hasn't then there was a tie
+    # break and we need to search for the point again, this time disallowing
+    # the previously identified cell: if we match the identified owned_rank AND
+    # the distance is the same then we have found the correct cell. If we
+    # cannot make a match to owned_rank and distance then we can't see the
+    # point.
+    changed_ranks_tied = changed_ranks & ~changed_ref_cell_dists_l1
+    if any(changed_ranks_tied):
+        cells_ignore_T = np.asarray([np.copy(parent_cell_nums)])
+        while any(changed_ranks_tied):
+            (
+                parent_cell_nums[changed_ranks_tied],
+                new_reference_coords,
+                ref_cell_dists_l1[changed_ranks_tied],
+            ) = parent_mesh.locate_cells_ref_coords_and_dists(
+                coords_global[changed_ranks_tied],
+                tolerance,
+                cells_ignore=cells_ignore_T.T[changed_ranks_tied, :],
+            )
+            # delete extra dimension if necessary
+            if parent_mesh.geometric_dimension() > parent_mesh.topological_dimension():
+                new_reference_coords = new_reference_coords[:, : parent_mesh.topological_dimension()]
+            reference_coords[changed_ranks_tied, :] = new_reference_coords
+            # remove newly lost points
+            locally_visible[changed_ranks_tied] = (
+                parent_cell_nums[changed_ranks_tied] != -1
+            )
+            changed_ranks_tied &= locally_visible
+            # if new ref_cell_dists_l1 > owned_ref_cell_dists_l1 then we should
+            # disregard the point.
+            locally_visible[changed_ranks_tied] &= (
+                ref_cell_dists_l1[changed_ranks_tied]
+                <= owned_ref_cell_dists_l1[changed_ranks_tied]
+            )
+            changed_ranks_tied &= locally_visible
+            # update the identified rank
+            ranks[changed_ranks_tied] = visible_ranks[
+                parent_cell_nums[changed_ranks_tied]
+            ]
+            # if the rank now matches then we have found the correct cell
+            locally_visible[changed_ranks_tied] &= (
+                owned_ranks[changed_ranks_tied] == ranks[changed_ranks_tied]
+            )
+            # remove these rank matches from changed_ranks_tied
+            changed_ranks_tied &= ~locally_visible
+            # add more cells to ignore
+            cells_ignore_T = np.vstack((
+                cells_ignore_T,
+                parent_cell_nums)
+            )
 
     # Any ranks which are still np.inf are not in the mesh
     missing_global_idxs = np.where(owned_ranks == np.inf)[0]
@@ -4102,8 +4543,8 @@ def RelabeledMesh(mesh, indicator_functions, subdomain_ids, **kwargs):
             plex1.createLabel(label_name)
     for f, subid in zip(indicator_functions, subdomain_ids):
         elem = f.topological.function_space().ufl_element()
-        if elem.value_shape != ():
-            raise RuntimeError(f"indicator functions must be scalar: got {elem.value_shape} != ()")
+        if elem.reference_value_shape != ():
+            raise RuntimeError(f"indicator functions must be scalar: got {elem.reference_value_shape} != ()")
         if elem.family() in {"Discontinuous Lagrange", "DQ"} and elem.degree() == 0:
             # cells
             height = 0
@@ -4160,3 +4601,81 @@ def SubDomainData(geometric_expr):
     # Create cell subset
     indices, = np.nonzero(f.dat.data_ro_with_halos > 0.5)
     return op2.Subset(m.cell_set, indices)
+
+
+def Submesh(mesh, subdim, subdomain_id, label_name=None, name=None):
+    """Construct a submesh from a given mesh.
+
+    Parameters
+    ----------
+    mesh : MeshGeometry
+        Parent mesh (`MeshGeometry`).
+    subdim : int
+        Topological dimension of the submesh.
+    subdomain_id : int
+        Subdomain ID representing the submesh.
+    label_name : str
+        Name of the label to search ``subdomain_id`` in.
+    name : str
+        Name of the submesh.
+
+    Returns
+    -------
+    MeshGeometry
+        Submesh.
+
+    Notes
+    -----
+    Currently, one can only make submeshes that have the same
+    topological dimension as the parent mesh.
+
+    Examples
+    --------
+
+    .. code-block:: python3
+
+        dim = 2
+        mesh = RectangleMesh(2, 1, 2., 1., quadrilateral=True)
+        x, y = SpatialCoordinate(mesh)
+        DQ0 = FunctionSpace(mesh, "DQ", 0)
+        indicator_function = Function(DQ0).interpolate(conditional(x > 1., 1, 0))
+        mesh.mark_entities(indicator_function, 999)
+        mesh = RelabeledMesh(mesh, [indicator_function], [999])
+        subm = Submesh(mesh, dim, 999)
+        V0 = FunctionSpace(mesh, "CG", 1)
+        V1 = FunctionSpace(subm, "CG", 1)
+        V = V0 * V1
+        u = TrialFunction(V)
+        v = TestFunction(V)
+        u0, u1 = split(u)
+        v0, v1 = split(v)
+        dx0 = Measure("dx", domain=mesh)
+        dx1 = Measure("dx", domain=subm)
+        a = inner(u1, v0) * dx0(999) + inner(u0, v1) * dx1
+        A = assemble(a)
+
+    """
+    if not isinstance(mesh, MeshGeometry):
+        raise TypeError("Parent mesh must be a `MeshGeometry`")
+    if isinstance(mesh.topology, ExtrudedMeshTopology):
+        raise NotImplementedError("Can not create a submesh of an ``ExtrudedMesh``")
+    elif isinstance(mesh.topology, VertexOnlyMeshTopology):
+        raise NotImplementedError("Can not create a submesh of a ``VertexOnlyMesh``")
+    mesh.topology.init()
+    plex = mesh.topology_dm
+    dim = plex.getDimension()
+    if subdim != dim:
+        raise NotImplementedError(f"Found submesh dim ({subdim}) != parent dim ({dim})")
+    if label_name is None:
+        label_name = dmcommon.CELL_SETS_LABEL
+    name = name or _generate_default_submesh_name(mesh.name)
+    subplex = dmcommon.submesh_create(plex, label_name, subdomain_id)
+    subplex.setName(_generate_default_mesh_topology_name(name))
+    if subplex.getDimension() != subdim:
+        raise RuntimeError(f"Found subplex dim ({subplex.getDimension()}) != expected ({subdim})")
+    submesh = Mesh(subplex, name=name, distribution_parameters={"partition": False,
+                                                                "overlap_type": (DistributedMeshOverlapType.NONE, 0)})
+    submesh.topology.submesh_parent = mesh.topology
+    submesh.submesh_parent = mesh
+    submesh.init()
+    return submesh

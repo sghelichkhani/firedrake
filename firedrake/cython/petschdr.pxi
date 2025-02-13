@@ -5,14 +5,10 @@ cimport numpy as np
 cdef extern from "mpi-compat.h":
     pass
 
-IF COMPLEX:
-    ctypedef np.complex128_t PetscScalar
-ELSE:
-    ctypedef double PetscScalar
-
 cdef extern from "petsc.h":
     ctypedef long PetscInt
     ctypedef double PetscReal
+    ctypedef double PetscScalar
     ctypedef enum PetscBool:
         PETSC_TRUE, PETSC_FALSE
     ctypedef enum PetscCopyMode:
@@ -53,6 +49,12 @@ cdef extern from "petscdmplex.h" nogil:
     int DMPlexSetAdjacencyUser(PETSc.PetscDM,int(*)(PETSc.PetscDM,PetscInt,PetscInt*,PetscInt[],void*),void*)
     int DMPlexCreatePointNumbering(PETSc.PetscDM,PETSc.PetscIS*)
     int DMPlexLabelComplete(PETSc.PetscDM, PETSc.PetscDMLabel)
+    int DMPlexDistributeOverlap(PETSc.PetscDM,PetscInt,PETSc.PetscSF*,PETSc.PetscDM*)
+
+    int DMPlexFilter(PETSc.PetscDM,PETSc.PetscDMLabel,PetscInt,PetscBool,PetscBool,PETSc.PetscSF*,PETSc.PetscDM*)
+    int DMPlexGetSubpointIS(PETSc.PetscDM,PETSc.PetscIS*)
+    int DMPlexGetSubpointMap(PETSc.PetscDM,PETSc.PetscDMLabel*)
+    int DMPlexSetSubpointMap(PETSc.PetscDM,PETSc.PetscDMLabel)
 
 cdef extern from "petscdmlabel.h" nogil:
     struct _n_DMLabel
@@ -71,6 +73,8 @@ cdef extern from "petscdm.h" nogil:
     int DMCreateLabel(PETSc.PetscDM,char[])
     int DMGetLabel(PETSc.PetscDM,char[],DMLabel*)
     int DMGetPointSF(PETSc.PetscDM,PETSc.PetscSF*)
+    int DMSetLabelValue(PETSc.PetscDM,char[],PetscInt,PetscInt)
+    int DMGetLabelValue(PETSc.PetscDM,char[],PetscInt,PetscInt*)
 
 cdef extern from "petscdmswarm.h" nogil:
     int DMSwarmGetLocalSize(PETSc.PetscDM,PetscInt*)
@@ -93,6 +97,7 @@ cdef extern from "petscis.h" nogil:
     int PetscSectionGetConstraintDof(PETSc.PetscSection,PetscInt,PetscInt*)
     int PetscSectionSetConstraintDof(PETSc.PetscSection,PetscInt,PetscInt)
     int PetscSectionSetConstraintIndices(PETSc.PetscSection,PetscInt, PetscInt[])
+    int PetscSectionGetConstraintIndices(PETSc.PetscSection,PetscInt, const PetscInt**)
     int PetscSectionGetMaxDof(PETSc.PetscSection,PetscInt*)
     int PetscSectionSetPermutation(PETSc.PetscSection,PETSc.PetscIS)
     int ISGetIndices(PETSc.PetscIS,PetscInt*[])

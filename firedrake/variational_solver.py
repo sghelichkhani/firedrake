@@ -10,11 +10,11 @@ from firedrake.petsc import (
     DEFAULT_SNES_PARAMETERS
 )
 from firedrake.function import Function
-from firedrake.functionspace import RestrictedFunctionSpace
-from firedrake.ufl_expr import TrialFunction, TestFunction
-from firedrake.bcs import DirichletBC, EquationBC
+from firedrake.ufl_expr import TrialFunction, TestFunction, action
+from firedrake.bcs import DirichletBC, EquationBC, extract_subdomain_ids, restricted_function_space
 from firedrake.adjoint_utils import NonlinearVariationalProblemMixin, NonlinearVariationalSolverMixin
-from ufl import replace
+from firedrake.__future__ import interpolate
+from ufl import replace, Form
 
 __all__ = ["LinearVariationalProblem",
            "LinearVariationalSolver",
@@ -88,19 +88,20 @@ class NonlinearVariationalProblem(NonlinearVariationalProblemMixin):
         self.restrict = restrict
 
         if restrict and bcs:
-            V_res = RestrictedFunctionSpace(V, boundary_set=set([bc.sub_domain for bc in bcs]))
-            bcs = [DirichletBC(V_res, bc.function_arg, bc.sub_domain) for bc in bcs]
+            V_res = restricted_function_space(V, extract_subdomain_ids(bcs))
+            bcs = [bc.reconstruct(V=V_res, indices=bc._indices) for bc in bcs]
             self.u_restrict = Function(V_res).interpolate(u)
             v_res, u_res = TestFunction(V_res), TrialFunction(V_res)
-            F_arg, = F.arguments()
-            replace_dict = {F_arg: v_res}
-            replace_dict[self.u] = self.u_restrict
-            self.F = replace(F, replace_dict)
+            if isinstance(F, Form):
+                F_arg, = F.arguments()
+                self.F = replace(F, {F_arg: v_res, self.u: self.u_restrict})
+            else:
+                self.F = action(replace(F, {self.u: self.u_restrict}), interpolate(v_res, V))
             v_arg, u_arg = self.J.arguments()
-            self.J = replace(self.J, {v_arg: v_res, u_arg: u_res})
+            self.J = replace(self.J, {v_arg: v_res, u_arg: u_res, self.u: self.u_restrict})
             if self.Jp:
                 v_arg, u_arg = self.Jp.arguments()
-                self.Jp = replace(self.Jp, {v_arg: v_res, u_arg: u_res})
+                self.Jp = replace(self.Jp, {v_arg: v_res, u_arg: u_res, self.u: self.u_restrict})
             self.restricted_space = V_res
         else:
             self.u_restrict = u
@@ -152,7 +153,8 @@ class NonlinearVariationalSolver(OptionsManager, NonlinearVariationalSolverMixin
                  pre_jacobian_callback=None,
                  post_jacobian_callback=None,
                  pre_function_callback=None,
-                 post_function_callback=None):
+                 post_function_callback=None,
+                 pre_apply_bcs=True):
         r"""
         :arg problem: A :class:`NonlinearVariationalProblem` to solve.
         :kwarg nullspace: an optional :class:`.VectorSpaceBasis` (or
@@ -181,6 +183,8 @@ class NonlinearVariationalSolver(OptionsManager, NonlinearVariationalSolverMixin
                before residual assembly.
         :kwarg post_function_callback: As above, but called immediately
                after residual assembly.
+        :kwarg pre_apply_bcs: If `False`, the problem is linearised
+               around the initial guess before imposing the boundary conditions.
 
         Example usage of the ``solver_parameters`` option: to set the
         nonlinear solver type to just use a linear solver, use
@@ -232,7 +236,8 @@ class NonlinearVariationalSolver(OptionsManager, NonlinearVariationalSolverMixin
                                          pre_function_callback=pre_function_callback,
                                          post_jacobian_callback=post_jacobian_callback,
                                          post_function_callback=post_function_callback,
-                                         options_prefix=self.options_prefix)
+                                         options_prefix=self.options_prefix,
+                                         pre_apply_bcs=pre_apply_bcs)
 
         self.snes = PETSc.SNES().create(comm=problem.dm.comm)
 
@@ -300,11 +305,12 @@ class NonlinearVariationalSolver(OptionsManager, NonlinearVariationalSolverMixin
         coefficients = utils.unique(chain.from_iterable(form.coefficients() for form in forms if form is not None))
         # Make sure the solution dm is visited last
         solution_dm = self.snes.getDM()
-        problem_dms = [V.dm for V in utils.unique(c.function_space() for c in coefficients) if V.dm != solution_dm]
+        problem_dms = [V.dm for V in utils.unique(chain.from_iterable(c.function_space() for c in coefficients)) if V.dm != solution_dm]
         problem_dms.append(solution_dm)
 
-        for dbc in problem.dirichlet_bcs():
-            dbc.apply(problem.u_restrict)
+        if self._ctx.pre_apply_bcs:
+            for bc in problem.dirichlet_bcs():
+                bc.apply(problem.u_restrict)
 
         if bounds is not None:
             lower, upper = bounds

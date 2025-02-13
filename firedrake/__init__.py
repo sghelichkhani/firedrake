@@ -1,22 +1,9 @@
-import firedrake_configuration
 import os
 import sys
-config = firedrake_configuration.get_config()
-if "PETSC_DIR" in os.environ and not config["options"]["honour_petsc_dir"]:
-    if os.environ["PETSC_DIR"] != os.path.join(sys.prefix, "src", "petsc")\
-       or os.environ["PETSC_ARCH"] != "default":
-        raise ImportError("PETSC_DIR is set, but you did not install with --honour-petsc-dir.\n"
-                          "Please unset PETSC_DIR (and PETSC_ARCH) before using Firedrake.")
-elif "PETSC_DIR" not in os.environ and config["options"]["honour_petsc_dir"]:
-    raise ImportError("Firedrake was installed with --honour-petsc-dir, but PETSC_DIR is not set.\n"
-                      "Please set PETSC_DIR (and PETSC_ARCH) before using Firedrake.")
-elif not config["options"]["honour_petsc_dir"]:  # Using our own PETSC.
-    os.environ["PETSC_DIR"] = os.path.join(sys.prefix, "src", "petsc")
-    os.environ["PETSC_ARCH"] = "default"
-del config
+from firedrake.configuration import setup_cache_dirs
 
 # Set up the cache directories before importing PyOP2.
-firedrake_configuration.setup_cache_dirs()
+setup_cache_dirs()
 
 # Ensure petsc is initialised by us before anything else gets in there.
 #
@@ -102,7 +89,6 @@ from firedrake.mg.embedded import *
 from firedrake.mg.opencascade_mh import *
 from firedrake.norms import *
 from firedrake.nullspace import *
-from firedrake.optimizer import *
 from firedrake.parameters import *
 from firedrake.parloops import *
 from firedrake.projection import *
@@ -119,7 +105,6 @@ from firedrake.ensemble import *
 from firedrake.randomfunctiongen import *
 from firedrake.external_operators import *
 from firedrake.progress_bar import ProgressBar  # noqa: F401
-from firedrake.fml import *
 
 from firedrake.logging import *
 # Set default log level
