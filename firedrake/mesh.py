@@ -4797,22 +4797,27 @@ def SubDomainData(geometric_expr):
     return op2.Subset(m.cell_set, indices)
 
 
-def Submesh(mesh, subdim, subdomain_id, label_name=None, name=None, ignore_halo=False, reorder=None, comm=None):
+def Submesh(mesh, subdim=None, subdomain_id=None, label_name=None, name=None, ignore_halo=False, reorder=None, comm=None):
     """Construct a submesh from a given mesh.
 
     Parameters
     ----------
     mesh : MeshGeometry
         Parent mesh (`MeshGeometry`).
-    subdim : int
+    subdim : int | None
         Topological dimension of the submesh.
+        Defaults to ``mesh.topological_dimension``.
     subdomain_id : int | None
         Subdomain ID representing the submesh.
-        `None` defines the submesh owned by the sub-communicator.
+        If `None` the submesh will cover the entire domain.
+        This is useful to obtain a codim-1 submesh over all facets or
+        a submesh over a different communicator.
     label_name : str | None
         Name of the label to search ``subdomain_id`` in.
+        Defaults to ``'Cell Sets'`` or ``'Face Sets'`` depending on ``subdim``.
     name : str |  None
         Name of the submesh.
+        Defaults to ``mesh.name + "_submesh"``·
     ignore_halo : bool
         Whether to exclude the halo from the submesh.
     reorder : bool | None
@@ -4855,24 +4860,24 @@ def Submesh(mesh, subdim, subdomain_id, label_name=None, name=None, ignore_halo=
         raise NotImplementedError("Can not create a submesh of an ``ExtrudedMesh``")
     elif isinstance(mesh.topology, VertexOnlyMeshTopology):
         raise NotImplementedError("Can not create a submesh of a ``VertexOnlyMesh``")
+    if subdim is None:
+        subdim = mesh.topological_dimension
     plex = mesh.topology_dm
     dim = plex.getDimension()
-    if subdim not in [dim, dim - 1]:
+    if subdim not in {dim, dim - 1}:
         raise NotImplementedError(f"Found submesh dim ({subdim}) and parent dim ({dim})")
-    if label_name is None:
+    if subdomain_id is None:
+        if label_name is not None:
+            raise ValueError("subdomain_id=None requires label_name=None.")
+        # Select all entities
+        label_name = "depth"
+        subdomain_id = subdim
+    elif label_name is None:
         if subdim == dim:
             label_name = dmcommon.CELL_SETS_LABEL
         elif subdim == dim - 1:
             label_name = dmcommon.FACE_SETS_LABEL
-    if subdomain_id is None:
-        # Filter the plex with PETSc's default label (cells owned by comm)
-        if label_name != dmcommon.CELL_SETS_LABEL:
-            raise ValueError("subdomain_id == None requires label_name == CELL_SETS_LABEL.")
-        subplex, sf = plex.filter(sanitizeSubMesh=True, ignoreHalo=ignore_halo, comm=comm)
-        dmcommon.submesh_update_facet_labels(plex, subplex)
-        dmcommon.submesh_correct_entity_classes(plex, subplex, sf)
-    else:
-        subplex = dmcommon.submesh_create(plex, subdim, label_name, subdomain_id, ignore_halo, comm=comm)
+    subplex = dmcommon.submesh_create(plex, subdim, label_name, subdomain_id, ignore_halo, comm=comm)
 
     comm = comm or mesh.comm
     name = name or _generate_default_submesh_name(mesh.name)
