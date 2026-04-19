@@ -3,6 +3,7 @@ from functools import wraps
 from pyadjoint.tape import get_working_tape, stop_annotating, annotate_tape, no_annotations
 from firedrake.adjoint_utils.blocks import NonlinearVariationalSolveBlock
 from firedrake.ufl_expr import derivative, adjoint
+import ufl
 from ufl import replace
 
 
@@ -86,17 +87,24 @@ class NonlinearVariationalSolverMixin:
 
                 # Forward variational solver.
                 if not self._ad_solvers["forward_nlvs"]:
+                    cloned_problem, replace_map = self._ad_problem_clone(
+                        self._ad_problem, block.get_dependencies())
+                    fwd_kwargs = self._ad_clone_kwargs(
+                        self._ad_kwargs, replace_map)
                     self._ad_solvers["forward_nlvs"] = type(self)(
-                        self._ad_problem_clone(self._ad_problem, block.get_dependencies()),
-                        **self._ad_kwargs
+                        cloned_problem, **fwd_kwargs
                     )
 
                 # Adjoint variational solver.
                 if not self._ad_solvers["adjoint_lvs"]:
                     with stop_annotating():
+                        adj_problem, adj_replace_map = self._ad_adj_lvs_problem(
+                            block, problem._ad_adj_F)
+                        adj_kwargs = self._ad_clone_kwargs(
+                            block.adj_kwargs, adj_replace_map)
                         self._ad_solvers["adjoint_lvs"] = LinearVariationalSolver(
-                            self._ad_adj_lvs_problem(block, problem._ad_adj_F),
-                            *block.adj_args, **block.adj_kwargs)
+                            adj_problem,
+                            *block.adj_args, **adj_kwargs)
                         if self._ad_problem._constant_jacobian:
                             self._ad_solvers["update_adjoint"] = False
 
@@ -121,6 +129,10 @@ class NonlinearVariationalSolverMixin:
         numerical values of the coefficients in the residual and jacobian, so in order not to
         affect the user-defined self._ad_problem.F, self._ad_problem.J and self._ad_problem.u
         expressions, we'll instead create clones of them.
+
+        Returns the cloned problem and the coefficient replace map used
+        for F (a superset of the J map).  The map is needed so that the
+        caller can apply the same replacement to ``appctx`` entries.
         """
         from firedrake import NonlinearVariationalProblem
         _ad_count_map, J_replace_map, F_replace_map = self._build_count_map(
@@ -132,11 +144,15 @@ class NonlinearVariationalSolverMixin:
         nlvp.is_linear = problem.is_linear
         nlvp._constant_jacobian = problem._constant_jacobian
         nlvp._ad_count_map_update(_ad_count_map)
-        return nlvp
+        return nlvp, F_replace_map
 
     @no_annotations
     def _ad_adj_lvs_problem(self, block, adj_F):
-        """Create the adjoint variational problem."""
+        """Create the adjoint variational problem.
+
+        Returns the cloned problem and the coefficient replace map, so
+        that the caller can apply the same replacement to ``appctx``.
+        """
         from firedrake import Function, Cofunction, LinearVariationalProblem
         # Homogeneous boundary conditions for the adjoint problem
         # when Dirichlet boundary conditions are applied.
@@ -157,7 +173,32 @@ class NonlinearVariationalSolverMixin:
             bcs=tmp_problem.bcs,
             constant_jacobian=self._ad_problem._constant_jacobian)
         lvp._ad_count_map_update(_ad_count_map)
-        return lvp
+        return lvp, J_replace_map
+
+    @staticmethod
+    def _ad_clone_kwargs(kwargs, replace_map):
+        """Return a shallow copy of *kwargs* with ``appctx`` entries cloned.
+
+        The ``appctx`` dict may contain UFL expressions (or plain
+        ``Function`` objects) that reference the *original* coefficients.
+        When the clone solver's form coefficients are deep-copied,
+        ``appctx`` must undergo the same replacement so that
+        preconditioners reading from ``appctx`` (e.g. ``MassInvPC``)
+        see the cloned values that ``_ad_solver_replace_forms`` keeps
+        in sync with the tape.
+        """
+        appctx = kwargs.get("appctx")
+        if not appctx:
+            return kwargs
+        cloned_appctx = {}
+        for key, value in appctx.items():
+            if isinstance(value, ufl.core.expr.Expr):
+                cloned_appctx[key] = ufl.replace(value, replace_map)
+            else:
+                cloned_appctx[key] = value
+        cloned = dict(kwargs)
+        cloned["appctx"] = cloned_appctx
+        return cloned
 
     def _build_count_map(self, J, dependencies, F=None):
         from firedrake import Function

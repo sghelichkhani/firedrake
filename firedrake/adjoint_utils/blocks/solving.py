@@ -574,7 +574,6 @@ def solve_init_params(self, args, kwargs, varform):
                 raise NotImplementedError(
                     "Annotation of adaptive solves not implemented."
                 )
-            self.adj_kwargs.pop("appctx", None)
 
     solver_params = kwargs.get("solver_parameters", None)
     if solver_params is not None and "mat_type" in solver_params:
